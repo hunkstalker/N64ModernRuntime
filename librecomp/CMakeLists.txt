@@ -50,11 +50,21 @@ target_include_directories(librecomp PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include/librecomp"
 )
 
-target_compile_options(librecomp PRIVATE
-#    -Wall
-#    -Wextra
-    -Wno-unused-parameter
+# o1heap.c requires C99 or newer; MSVC's C mode defaults to C89.
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/o1heap/o1heap/o1heap.c"
+    PROPERTIES COMPILE_OPTIONS "$<$<C_COMPILER_ID:MSVC>:/std:c11>"
 )
+
+if (MSVC)
+    target_compile_options(librecomp PRIVATE /W3)
+else()
+    target_compile_options(librecomp PRIVATE
+    #    -Wall
+    #    -Wextra
+        -Wno-unused-parameter
+    )
+endif()
 
 if (WIN32)
     add_compile_definitions(NOMINMAX)

@@ -44,6 +44,7 @@ namespace recomp {
         size_t num_base_events();
 
         void add_loaded_function(int32_t ram_addr, recomp_func_t* func);
+        void register_flat_code();
 
         struct BasePatchedFunction {
             size_t patch_section;

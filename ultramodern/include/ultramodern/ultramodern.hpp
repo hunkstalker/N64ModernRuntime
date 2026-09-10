@@ -25,6 +25,10 @@ struct UltraThreadContext {
     std::thread host_thread;
     moodycamel::LightweightSemaphore running;
     moodycamel::LightweightSemaphore initialized;
+    // Prevents the same context from being enqueued for cleanup more than once, which
+    // would make the cleaner call join() on an already-joined (non-joinable) std::thread
+    // and throw std::system_error -> std::terminate.
+    std::atomic_bool cleaned_up{false};
 };
 
 namespace ultramodern {
@@ -72,6 +76,7 @@ struct MessageQueueControl {
     bool requeue_dp = true;
 };
 void set_message_queue_control(const MessageQueueControl& mqc);
+void set_external_rdram(uint8_t* rdram);
 void enqueue_external_message_src(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, EventMessageSource src);
 void enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked);
 void wait_for_external_message(RDRAM_ARG1);

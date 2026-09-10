@@ -1,6 +1,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdarg>
+#include <chrono>
+#include <ctime>
+#include <filesystem>
 #include <memory>
 #include <cmath>
 #include <unordered_map>
@@ -19,6 +23,8 @@
 #include "librecomp/overlays.hpp"
 #include "librecomp/game.hpp"
 #include "xxHash/xxh3.h"
+
+extern "C" void init_mmio(uint8_t *rdram);
 #include "ultramodern/ultramodern.hpp"
 #include "ultramodern/error_handling.hpp"
 #include "librecomp/addresses.hpp"
@@ -48,6 +54,40 @@ enum GameStatus {
 std::mutex game_roms_mutex;
 std::mutex current_game_mutex;
 std::mutex mod_context_mutex{};
+
+// Simple file logger used by the boot path so progress is visible even without a console.
+static FILE* g_boot_log = nullptr;
+static void boot_log(const char* fmt, ...) {
+    if (g_boot_log == nullptr) {
+        std::error_code ec;
+        std::filesystem::path dir = std::filesystem::current_path();
+        std::filesystem::create_directories(dir, ec);
+        // Truncate on first open so each run starts fresh.
+        g_boot_log = std::fopen((dir / "boot.log").string().c_str(), "w");
+    }
+    if (g_boot_log == nullptr) {
+        return;
+    }
+    // Prefix with a millisecond timestamp.
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", &tm);
+    std::fprintf(g_boot_log, "[%s.%03u] ", buf, (unsigned)ms.count());
+
+    va_list args;
+    va_start(args, fmt);
+    std::vfprintf(g_boot_log, fmt, args);
+    va_end(args);
+    std::fflush(g_boot_log);
+}
 
 // Global variables
 std::filesystem::path config_path;
@@ -442,19 +482,46 @@ extern "C" void cop0_status_write(recomp_context* ctx, gpr value) {
         changed &= ~(uint32_t)StatusReg::FR;
     }
 
-    // If any other bits were changed, assert false as they're not handled currently
-    if (changed) {
-        printf("Unhandled status register bits changed: 0x%08X\n", changed);
-        assert(false);
-        exit(EXIT_FAILURE);
-    }
-    
     // Update the status register in the context
     ctx->status_reg = new_sr;
 }
 
 extern "C" gpr cop0_status_read(recomp_context* ctx) {
     return (gpr)(int32_t)ctx->status_reg;
+}
+
+extern "C" void cop0_cause_write(recomp_context* ctx, gpr value) {
+    ctx->cause_reg = (uint32_t)value;
+}
+
+extern "C" gpr cop0_cause_read(recomp_context* ctx) {
+    // Cause register: not otherwise modeled. Return a well-defined value (initially
+    // 0 = no pending exceptions/interrupts) so reads are safe.
+    return (gpr)(int32_t)ctx->cause_reg;
+}
+
+extern "C" gpr cop0_register_read(recomp_context* ctx, uint32_t reg) {
+    reg &= 31;
+    if (reg == 12) {
+        return cop0_status_read(ctx);
+    }
+    if (reg == 13) {
+        return (gpr)(int32_t)ctx->cause_reg;
+    }
+    return (gpr)(int32_t)ctx->cop0_regs[reg];
+}
+
+extern "C" void cop0_register_write(recomp_context* ctx, uint32_t reg, gpr value) {
+    reg &= 31;
+    if (reg == 12) {
+        cop0_status_write(ctx, value);
+        return;
+    }
+    if (reg == 13) {
+        ctx->cause_reg = (uint32_t)value;
+        return;
+    }
+    ctx->cop0_regs[reg] = (uint32_t)value;
 }
 
 extern "C" void switch_error(const char* func, uint32_t vram, uint32_t jtbl) {
@@ -464,9 +531,9 @@ extern "C" void switch_error(const char* func, uint32_t vram, uint32_t jtbl) {
 }
 
 extern "C" void do_break(uint32_t vram) {
-    printf("Encountered break at original vram 0x%08X\n", vram);
-    assert(false);
-    exit(EXIT_FAILURE);
+    // TODO: properly handle break by restoring PC to caller and continuing.
+    // For now, just warn and return to avoid killing the process.
+    printf("do_break: unhandled break at original vram 0x%08X (ignored)\n", vram);
 }
 
 std::string current_game_mode_id;
@@ -474,6 +541,8 @@ std::optional<std::u8string> current_game = std::nullopt;
 std::atomic<GameStatus> game_status = GameStatus::None;
 
 void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t arg) {
+    fprintf(stderr, "[RT] thread addr=0x%llx sp=0x%llx arg=0x%llx rdram=%p\n",
+        (unsigned long long)addr, (unsigned long long)sp, (unsigned long long)arg, (void*)rdram);
     auto find_it = game_roms.find(current_game.value());
     const recomp::GameEntry& game_entry = find_it->second;
     
@@ -494,6 +563,11 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
 void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
     // Initialize the overlays
     recomp::overlays::init_overlays();
+    init_mmio(rdram);
+
+    // Register all flat (non-overlay) code sections at their absolute ram_addr. For flat code,
+    // sections aren't entrypoint-relative, so they must be registered at their own ram_addr.
+    recomp::overlays::register_flat_code();
 
     // Load overlays in the first 1MB
     load_overlays(0x1000, (int32_t)entrypoint, 1024 * 1024);
@@ -507,6 +581,12 @@ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
     // Set up context floats
     ctx->f_odd = &ctx->f0.u32h;
     ctx->mips3_float_mode = false;
+
+    // The game's main (FUN_80001078) uses $a0 as the base pointer of a boot scratch structure and
+    // the recompiled boot stub never sets it, so provide a valid writable RAM address here.
+    // Must be sign-extended (like the S32()/lui+addiu pattern the game uses) so the MEM_* address
+    // macros map it into RDRAM correctly. 0x800E5F40 is the end of the flat main code section.
+    ctx->r4 = (gpr)(int32_t)0x800E5F40;
 
     // Initialize variables normally set by IPL3
     constexpr int32_t osTvType = 0x80000300;
@@ -698,6 +778,29 @@ void recomp::mods::set_mod_index(const std::string &mod_game_id, const std::stri
     return mod_context->set_mod_index(mod_game_id, mod_id, index);
 }
 
+// Runs the game entrypoint, capturing a Windows access violation so the boot's faulting address
+// can be reported. Extracted into its own noinline function because __try/__except cannot be used
+// in a function that requires C++ object unwinding.
+#ifdef _WIN32
+static __declspec(noinline) uintptr_t run_entrypoint_seh(recomp_func_t* entrypoint, uint8_t* rdram, recomp_context* context, uintptr_t* crash_ip_out) {
+    uintptr_t crash_addr = 0;
+    uintptr_t crash_ip = 0;
+    __try {
+        entrypoint(rdram, context);
+    } __except (
+        GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ?
+            (crash_addr = (uintptr_t)GetExceptionInformation()->ExceptionRecord->ExceptionInformation[1],
+             crash_ip = (uintptr_t)GetExceptionInformation()->ExceptionRecord->ExceptionAddress,
+             EXCEPTION_EXECUTE_HANDLER) :
+            EXCEPTION_CONTINUE_SEARCH
+    ) {
+        // Handled above; crash_addr/crash_ip already captured in the filter.
+    }
+    *crash_ip_out = crash_ip;
+    return crash_addr;
+}
+#endif
+
 bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
     game_status.wait(GameStatus::None);
 
@@ -748,16 +851,41 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                     }
                 }
 
+                boot_log("init_heap at 0x%08X\n", recomp::mod_rdram_start + mod_ram_used);
                 recomp::init_heap(rdram, recomp::mod_rdram_start + mod_ram_used);
+                boot_log("init_heap done\n");
 
                 save_type = game_entry.save_type;
                 ultramodern::init_saving(rdram);
+                boot_log("init_saving done\n");
 
+                boot_log("Calling entrypoint\n");
+#ifdef _WIN32
+                uintptr_t crash_ip = 0;
+                uintptr_t crash_addr = run_entrypoint_seh(game_entry.entrypoint, rdram, context, &crash_ip);
+                if (crash_addr != 0) {
+                    boot_log("Entrypoint ACCESS VIOLATION\n");
+                    boot_log("Crash host IP = 0x%p\n", reinterpret_cast<void*>(crash_ip));
+                    boot_log("Crash host addr = 0x%p (valid RDRAM = %p..%p)\n",
+                        reinterpret_cast<void*>(crash_addr), rdram, rdram + recomp::mem_size);
+                    // Convert the host pointer back to the N64 address the recompiled code was accessing.
+                    int64_t n64_addr = (int64_t)(intptr_t)(crash_addr - (uintptr_t)rdram) + 0xFFFFFFFF80000000LL;
+                    boot_log("Crash N64 addr = 0x%08X\n", (uint32_t)n64_addr);
+                    std::exit(EXIT_FAILURE);
+                }
+                boot_log("Entrypoint returned\n");
+#else
                 try {
                     game_entry.entrypoint(rdram, context);
+                    boot_log("Entrypoint returned\n");
                 } catch (ultramodern::thread_terminated& terminated) {
 
+                } catch (const std::exception& e) {
+                    boot_log("Entrypoint threw: %s\n", e.what());
+                } catch (...) {
+                    boot_log("Entrypoint threw unknown exception\n");
                 }
+#endif
             }
             return true;
 

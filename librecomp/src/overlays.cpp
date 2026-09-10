@@ -150,6 +150,18 @@ void recomp::overlays::add_loaded_function(int32_t ram, recomp_func_t* func) {
     func_map[ram] = func;
 }
 
+// Registers every function of every code section at its absolute ram_addr. This is used for flat
+// (non-overlay) code where each section has its own absolute ram_addr that isn't entrypoint-relative.
+void recomp::overlays::register_flat_code() {
+    for (size_t section_index = 0; section_index < sections_info.num_code_sections; section_index++) {
+        const SectionTableEntry& section = sections_info.code_sections[section_index];
+        for (size_t function_index = 0; function_index < section.num_funcs; function_index++) {
+            const FuncEntry& func = section.funcs[function_index];
+            func_map[section.ram_addr + func.offset] = func.func;
+        }
+    }
+}
+
 void load_overlay(size_t section_table_index, int32_t ram) {
     const SectionTableEntry& section = sections_info.code_sections[section_table_index];
 

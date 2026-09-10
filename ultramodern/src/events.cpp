@@ -140,6 +140,10 @@ static struct {
     moodycamel::BlockingConcurrentQueue<Action> action_queue{};
     moodycamel::BlockingConcurrentQueue<OSTask*> sp_task_queue{};
     moodycamel::ConcurrentQueue<OSThread*> deleted_threads{};
+    struct {
+        PTR(OSMesgQueue) mq = NULLPTR;
+        OSMesg msg = (OSMesg)0;
+    } vi_event;
 } events_context{};
 
 ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
@@ -148,6 +152,7 @@ ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
 
 extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_, OSMesg msg) {
     std::lock_guard lock{ events_context.message_mutex };
+    fprintf(stderr, "[EV] osSetEventMesg event=%d mq=%p msg=%p\n", (int)event_id, (void*)mq_, (void*)msg);
 
     switch (event_id) {
         case OS_EVENT_SP:
@@ -165,10 +170,16 @@ extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_,
         case OS_EVENT_SI:
             events_context.si.msg = msg;
             events_context.si.mq = mq_;
+            break;
+        case OS_EVENT_VI:
+            events_context.vi_event.msg = msg;
+            events_context.vi_event.mq = mq_;
+            break;
     }
 }
 
 extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 retrace_count) {
+    fprintf(stderr, "[VIEV] osViSetEvent mq=%p msg=%p retrace=%u\n", (void*)mq_, (void*)msg, retrace_count);
     std::lock_guard lock{ events_context.message_mutex };
     ViState* next_state = events_context.vi.get_next_state();
     next_state->mq = mq_;
@@ -242,9 +253,16 @@ void vi_thread_func() {
             ViState* cur_state = events_context.vi.get_cur_state();
             if (remaining_retraces == 0) {
                 if (cur_state->mq != NULLPTR) {
+                    fprintf(stderr, "[EV] VI retrace fire mq=%p\n", (void*)cur_state->mq);
                     // Send a message to the VI queue, and do not set it to be requeued if the queue was full.
                     // The worst case scenario is that the game misses a VI message and has to wait a little longer for the next. 
                     ultramodern::enqueue_external_message_src(cur_state->mq, cur_state->msg, false, ultramodern::EventMessageSource::Vi);
+                } else {
+                    fprintf(stderr, "[EV] VI retrace fire but mq=NULLPTR\n");
+                }
+                // The game may have registered the VI interrupt via osSetEventMesg(OS_EVENT_VI=7) instead of osViSetEvent.
+                if (events_context.vi_event.mq != NULLPTR) {
+                    ultramodern::enqueue_external_message_src(events_context.vi_event.mq, events_context.vi_event.msg, false, ultramodern::EventMessageSource::Vi);
                 }
                 remaining_retraces = cur_state->retrace_count;
             }
@@ -565,6 +583,8 @@ extern "C" PTR(void) osViGetCurrentFramebuffer() {
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
 
+    fprintf(stderr, "[SPT] submit_rsp_task task=%p type=%d\n", (void*)task, (int)task->t.type);
+
     // Send gfx tasks to the graphics action queue
     if (task->t.type == M_GFXTASK) {
         events_context.action_queue.enqueue(SpTaskAction{ *task });
@@ -583,6 +603,7 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
     moodycamel::LightweightSemaphore gfx_thread_ready;
     moodycamel::LightweightSemaphore task_thread_ready;
     events_context.rdram = rdram;
+    ultramodern::set_external_rdram(rdram);
     events_context.sp.gfx_thread = std::thread{ gfx_thread_func, rdram, &gfx_thread_ready, window_handle };
     events_context.sp.task_thread = std::thread{ task_thread_func, rdram, &task_thread_ready };
 
