@@ -192,6 +192,10 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
     thread_self = self_;
     is_game_thread = true;
 
+    // Keep the game's __osRunningThread global (0x80049940) in sync so that
+    // game code that reads the current thread directly sees the right value.
+    *(uint32_t*)(rdram + 0x49940) = (uint32_t)self_;
+
     // Set the thread name
     ultramodern::set_native_thread_name(ultramodern::threads::get_game_thread_name(self));
     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::High);
@@ -201,10 +205,18 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
 
     debug_printf("[Thread] Thread waiting to be started: %d\n", self->id);
 
+    // Ensure the context is always cleaned up (and its host_thread joined) no matter how
+    // this function exits. Otherwise a leaked/unjoined host_thread can be destroyed while
+    // still joinable -> std::terminate ("terminate called without an active exception").
+    struct CleanupGuard {
+        UltraThreadContext* ctx;
+        ~CleanupGuard() { ultramodern::cleanup_thread(ctx); }
+    } guard{thread_context};
+
     // Wait until the thread is marked as running.
     try {
         wait_for_resumed(PASS_RDRAM thread_context);
-    } catch (ultramodern::thread_terminated& terminated) {
+    } catch (...) {
     }
 
     // Make sure the thread wasn't replaced or destroyed before it was started.
@@ -213,7 +225,7 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
         try {
             // Run the thread's function with the provided argument.
             run_thread_function(PASS_RDRAM entrypoint, self->sp, arg);
-        } catch (ultramodern::thread_terminated& terminated) {
+        } catch (...) {
         }
     }
     else {
@@ -224,15 +236,16 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
     // so mark this thread as destroyed and run the next queued thread.
     if (self->context == thread_context) {
         self->context = nullptr;
-        run_next_thread(PASS_RDRAM1);
+        try {
+            run_next_thread(PASS_RDRAM1);
+        } catch (...) {
+        }
     }
-
-    // Dispose of this thread now that it's completed or terminated.
-    ultramodern::cleanup_thread(thread_context);
 }
 
 extern "C" void osStartThread(RDRAM_ARG PTR(OSThread) t_) {
     OSThread* t = TO_PTR(OSThread, t_);
+    fprintf(stderr, "[TH] osStartThread t=%p id=%d\n", (void*)t_, (int)t->id);
     debug_printf("[os] Start Thread %d\n", t->id);
 
     // If this is a game thread, insert the new thread into the running queue and then check the running queue.
@@ -250,6 +263,7 @@ extern "C" void osStartThread(RDRAM_ARG PTR(OSThread) t_) {
 
 extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_func_t) entrypoint, PTR(void) arg, PTR(void) sp, OSPri pri) {
     debug_printf("[os] Create Thread %d\n", id);
+    fprintf(stderr, "[TH] osCreateThread id=%d entry=0x%x arg=0x%x\n", (int)id, (uint32_t)entrypoint, (uint32_t)arg);
     OSThread *t = TO_PTR(OSThread, t_);
     
     t->next = NULLPTR;
@@ -274,12 +288,20 @@ extern "C" void osStopThread(RDRAM_ARG PTR(OSThread) t_) {
     if (t_ == NULLPTR) {
         t_ = thread_self;
     }
+    OSThread* t = TO_PTR(OSThread, t_);
     // Check if the thread is stopping itself (arg is null or thread_self).
     if (t_ == thread_self) {
         ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
     }
     else {
-        assert(false);
+        // Stop another thread: deschedule it from the run queue and mark it stopped.
+        // Its host thread stays parked (it's not the active one), and it can be
+        // restarted later with osStartThread. Do NOT null the context (that would
+        // destroy it); stopping keeps the thread restorable.
+        if (t->state != OSThreadState::STOPPED) {
+            ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+            t->state = OSThreadState::STOPPED;
+        }
     }
 }
 
@@ -352,7 +374,9 @@ void thread_cleaner_func() {
         if (deleted_threads.wait_dequeue_timed(to_delete, 10ms)) {
             debug_printf("[Cleanup] Deleting thread context %p\n", to_delete);
 
-            to_delete->host_thread.join();
+            if (to_delete->host_thread.joinable()) {
+                to_delete->host_thread.join();
+            }
             delete to_delete;
         }
     }
@@ -363,7 +387,12 @@ void ultramodern::init_thread_cleanup() {
 }
 
 void ultramodern::cleanup_thread(UltraThreadContext *cur_context) {
-    deleted_threads.enqueue(cur_context);
+    // Guard against enqueueing the same context more than once (e.g. if cleanup is triggered
+    // by more than one path). Double-enqueueing would make the cleaner join() a thread that
+    // is no longer joinable and throw std::system_error -> std::terminate.
+    if (!cur_context->cleaned_up.exchange(true)) {
+        deleted_threads.enqueue(cur_context);
+    }
 }
 
 void ultramodern::join_thread_cleaner_thread() {
