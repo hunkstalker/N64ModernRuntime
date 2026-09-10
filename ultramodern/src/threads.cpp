@@ -2,6 +2,7 @@
 #include <thread>
 #include <cassert>
 #include <string>
+#include <mutex>
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -33,6 +34,29 @@ thread_local bool is_entrypoint_thread = false;
 // Whether this thread is part of the game (i.e. the start thread or one spawned by osCreateThread)
 thread_local bool is_game_thread = false;
 thread_local PTR(OSThread) thread_self = NULLPTR;
+
+// The N64 is a single-CPU machine: only one game thread may ever be executing at a time.
+// The cooperative scheduler handles yields, but osStartThread from the boot thread
+// (thread_self == NULL) signals a thread without parking the boot thread, so both can run
+// concurrently on their host threads. A global lock serializes all game-thread execution so
+// the recompiled code observes a true single-threaded machine. Each game thread holds this
+// lock while it runs and releases it every time it parks (see wait_for_resumed).
+static std::mutex game_mutex;
+static thread_local bool holds_game_lock = false;
+
+void ultramodern::acquire_game_lock() {
+    if (!holds_game_lock) {
+        game_mutex.lock();
+        holds_game_lock = true;
+    }
+}
+
+void ultramodern::release_game_lock() {
+    if (holds_game_lock) {
+        holds_game_lock = false;
+        game_mutex.unlock();
+    }
+}
 
 void ultramodern::set_entrypoint_thread() {
     ::is_game_thread = true;
@@ -151,7 +175,11 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
 #endif
 
 void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
+    // Release the game lock so the thread being resumed can acquire it and run; then park this
+    // thread. Re-acquire the lock once we're resumed.
+    ultramodern::release_game_lock();
     thread_context->running.wait();
+    ultramodern::acquire_game_lock();
     // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
     // This will trigger thread cleanup instead.
     if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
@@ -236,10 +264,18 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
     // so mark this thread as destroyed and run the next queued thread.
     if (self->context == thread_context) {
         self->context = nullptr;
+        // Release the game lock before handing execution to the next thread, otherwise the
+        // thread we resume will block forever trying to acquire it.
+        ultramodern::release_game_lock();
         try {
             run_next_thread(PASS_RDRAM1);
         } catch (...) {
         }
+    }
+    else {
+        // Thread was destroyed before it was started; it still holds the game lock (acquired by
+        // wait_for_resumed), so release it before exiting so other threads can run.
+        ultramodern::release_game_lock();
     }
 }
 

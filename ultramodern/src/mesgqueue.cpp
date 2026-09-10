@@ -72,7 +72,10 @@ void dequeue_external_messages(RDRAM_ARG1) {
 
 void ultramodern::wait_for_external_message(RDRAM_ARG1) {
     QueuedMessage to_send;
+    // Release the game lock while parked so other game threads can run.
+    ultramodern::release_game_lock();
     external_messages.wait_dequeue(to_send);
+    ultramodern::acquire_game_lock();
     if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
         external_messages.enqueue(to_send);
     }
@@ -80,10 +83,15 @@ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
 
 void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
     QueuedMessage to_send;
+    ultramodern::release_game_lock();
     if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
+        ultramodern::acquire_game_lock();
         if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
             external_messages.enqueue(to_send);
         }
+    }
+    else {
+        ultramodern::acquire_game_lock();
     }
 }
 

@@ -90,6 +90,12 @@ void schedule_running_thread(RDRAM_ARG PTR(OSThread) t);
 void cleanup_thread(UltraThreadContext* thread_context);
 struct thread_terminated : std::exception {};
 
+// Serializes all game-thread execution so the recompiled code observes a true single-CPU N64.
+// Each game thread holds the lock while running and releases it whenever it parks. The boot /
+// entrypoint thread must hold it for the duration of the entrypoint.
+void acquire_game_lock();
+void release_game_lock();
+
 enum class ThreadPriority {
     Low,
     Normal,

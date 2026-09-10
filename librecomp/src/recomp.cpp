@@ -876,13 +876,21 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                 boot_log("Entrypoint returned\n");
 #else
                 try {
+                    // The entrypoint is the boot/main thread. Hold the game lock so any threads it
+                    // spawns (via osStartThread from a NULL thread_self) cannot run concurrently with
+                    // it; they block on the lock until the entrypoint returns and releases it.
+                    ultramodern::acquire_game_lock();
                     game_entry.entrypoint(rdram, context);
+                    ultramodern::release_game_lock();
                     boot_log("Entrypoint returned\n");
                 } catch (ultramodern::thread_terminated& terminated) {
+                    ultramodern::release_game_lock();
 
                 } catch (const std::exception& e) {
+                    ultramodern::release_game_lock();
                     boot_log("Entrypoint threw: %s\n", e.what());
                 } catch (...) {
+                    ultramodern::release_game_lock();
                     boot_log("Entrypoint threw unknown exception\n");
                 }
 #endif
