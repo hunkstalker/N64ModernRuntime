@@ -16,6 +16,16 @@ struct QueuedMessage {
 static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
 std::bitset<32> requeue_enabled;
 
+// Global RDRAM pointer so that external (non-game) threads can deliver a message directly
+// to a message queue and wake up any game thread blocked on receiving from it.
+static uint8_t* external_rdram = nullptr;
+
+bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
+
+void ultramodern::set_external_rdram(uint8_t* rdram) {
+    external_rdram = rdram;
+}
+
 void ultramodern::set_message_queue_control(const ultramodern::MessageQueueControl& mqc) {
     requeue_enabled.reset();
     requeue_enabled.set(static_cast<int>(EventMessageSource::Timer), mqc.requeue_timer);
@@ -28,14 +38,24 @@ void ultramodern::set_message_queue_control(const ultramodern::MessageQueueContr
 }
 
 void ultramodern::enqueue_external_message_src(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, EventMessageSource src) {
+    fprintf(stderr, "[MQ] EXT send mq=%p msg=%p src=%d\n", (void*)mq, (void*)msg, (int)src);
+    // Deliver the message directly from the external thread. This immediately writes it into
+    // the game's message queue and schedules any game thread blocked on receiving from it,
+    // which is required for external events (VI/AI/SP/DP/etc.) to wake a blocked game thread.
+    // The external_messages queue is only a fallback if the direct delivery fails (queue full).
+    if (external_rdram != nullptr && do_send(external_rdram, mq, msg, jam, false)) {
+        return;
+    }
     external_messages.enqueue({mq, msg, jam, requeue_enabled[static_cast<int>(src)]});
 }
 
 void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
+    // Deliver directly if possible so blocked game threads wake immediately.
+    if (external_rdram != nullptr && do_send(external_rdram, mq, msg, jam, false)) {
+        return;
+    }
     external_messages.enqueue({mq, msg, jam, requeue_if_blocked});
 }
-
-bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
 
 void dequeue_external_messages(RDRAM_ARG1) {
     QueuedMessage to_send;
@@ -68,6 +88,7 @@ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
 }
 
 extern "C" void osCreateMesgQueue(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg, s32 count) {
+    fprintf(stderr, "[MQ] osCreateMesgQueue mq=%p msg=%p count=%d\n", (void*)mq_, (void*)msg, (int)count);
     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
     mq->blocked_on_recv = NULLPTR;
     mq->blocked_on_send = NULLPTR;
@@ -138,6 +159,16 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
     } else {
         // Otherwise, yield this thread in a loop until the queue is no longer full
         while (MQ_IS_EMPTY(mq)) {
+            // Flush any externally-enqueued messages (from the VI/AI/SP/DP/etc. threads) into
+            // the queue. Without this, a thread blocked on receive would never see a message
+            // that arrives after it started blocking, since dequeue_external_messages is only
+            // called at the start of osSendMesg/osRecvMesg.
+            dequeue_external_messages(PASS_RDRAM1);
+            if (!MQ_IS_EMPTY(mq)) {
+                break;
+            }
+            fprintf(stderr, "[MQ] BLOCK recv thread=%d mq=%p validCount=%d msgCount=%d\n",
+                (int)TO_PTR(OSThread, ultramodern::this_thread())->id, (void*)mq_, (int)mq->validCount, (int)mq->msgCount);
             debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
@@ -163,6 +194,7 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
 extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
     bool jam = false;
+    fprintf(stderr, "[MQ] osSendMesg mq=%p msg=%p flags=%d\n", (void*)mq_, (void*)msg, flags);
     
     // Don't directly send to the message queue if this isn't a game thread to avoid contention.
     if (!ultramodern::is_game_thread()) {
@@ -206,6 +238,7 @@ extern "C" s32 osJamMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) 
 
 extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 flags) {
     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
+    fprintf(stderr, "[MQ] osRecvMesg mq=%p msg=%p flags=%d\n", (void*)mq_, (void*)msg_, flags);
     
     assert(ultramodern::is_game_thread() && "RecvMesg not allowed outside of game threads.");
     
