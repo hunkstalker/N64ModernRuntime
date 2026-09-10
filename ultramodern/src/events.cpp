@@ -264,6 +264,13 @@ void vi_thread_func() {
                 if (events_context.vi_event.mq != NULLPTR) {
                     ultramodern::enqueue_external_message_src(events_context.vi_event.mq, events_context.vi_event.msg, false, ultramodern::EventMessageSource::Vi);
                 }
+                // DUMP: render-mode state of the game (DAT_80037750 / DAT_80037730 / DAT_80037738)
+                if ((total_vis % 60) == 0) {
+                    uint8_t* g = events_context.rdram;
+                    auto rd = [&](uint32_t a){ return *(uint32_t*)&g[a & 0x1FFFFFFF]; };
+                    fprintf(stderr, "[RND] vis=%llu 3750=0x%08X 3730=0x%08X 3738=0x%08X 3734=0x%08X 373c=0x%08X\n",
+                        (unsigned long long)total_vis, rd(0x80037750), rd(0x80037730), rd(0x80037738), rd(0x80037734), rd(0x8003773c));
+                }
                 remaining_retraces = cur_state->retrace_count;
             }
             if (events_context.ai.mq != NULLPTR) {
