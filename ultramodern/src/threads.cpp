@@ -204,6 +204,13 @@ void run_next_thread(RDRAM_ARG1) {
 
 void ultramodern::run_next_thread_and_wait(RDRAM_ARG1) {
     UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
+    // If there are no runnable game threads, idle on external (hardware/OS) messages instead of
+    // aborting. Processing an external message on this game thread delivers it under the game
+    // lock and may schedule a thread blocked on receive into the running queue. (racer patch:
+    // "run_next_thread_and_wait idles on external messages when running queue is empty".)
+    while (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
+        ultramodern::wait_for_external_message(PASS_RDRAM1);
+    }
     run_next_thread(PASS_RDRAM1);
     wait_for_resumed(PASS_RDRAM cur_context);
 }

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -373,10 +374,17 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t 
     return get_func_by_section_index_function_offset(find_section_it->second, func_offset);
 }
 
+// Stub para el modo soft-lookup (HH_SOFT_LOOKUP=1): permite que el boot continúe y revele más
+// funciones faltantes en un solo run. Solo para depuración de símbolos.
+static void soft_missing_func(uint8_t*, recomp_context*) {}
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {
         fprintf(stderr, "Failed to find function at 0x%08X\n", addr);
+        if (getenv("HH_SOFT_LOOKUP") != nullptr) {
+            return soft_missing_func;
+        }
         assert(false);
         std::exit(EXIT_FAILURE);
     }

@@ -313,9 +313,15 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
             return;
         }
 
+        // Execute the RSP task. Tasks without a registered ucode (p. ej. audio, M_AUDTASK=2) se
+        // tratan como no-op: se completa igualmente para que el juego avance (audio dummy).
         if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
-            fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", task->t.type);
-            ULTRAMODERN_QUICK_EXIT();
+            static bool warned[64] = {};
+            uint32_t t = static_cast<uint32_t>(task->t.type);
+            if (t < 64 && !warned[t]) {
+                warned[t] = true;
+                fprintf(stderr, "[RSP] sin ucode para task type %u -> no-op (dummy)\n", t);
+            }
         }
 
         // Tell the game that the RSP has completed
@@ -610,7 +616,6 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
     moodycamel::LightweightSemaphore gfx_thread_ready;
     moodycamel::LightweightSemaphore task_thread_ready;
     events_context.rdram = rdram;
-    ultramodern::set_external_rdram(rdram);
     events_context.sp.gfx_thread = std::thread{ gfx_thread_func, rdram, &gfx_thread_ready, window_handle };
     events_context.sp.task_thread = std::thread{ task_thread_func, rdram, &task_thread_ready };
 

@@ -16,15 +16,7 @@ struct QueuedMessage {
 static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
 std::bitset<32> requeue_enabled;
 
-// Global RDRAM pointer so that external (non-game) threads can deliver a message directly
-// to a message queue and wake up any game thread blocked on receiving from it.
-static uint8_t* external_rdram = nullptr;
-
 bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
-
-void ultramodern::set_external_rdram(uint8_t* rdram) {
-    external_rdram = rdram;
-}
 
 void ultramodern::set_message_queue_control(const ultramodern::MessageQueueControl& mqc) {
     requeue_enabled.reset();
@@ -38,22 +30,10 @@ void ultramodern::set_message_queue_control(const ultramodern::MessageQueueContr
 }
 
 void ultramodern::enqueue_external_message_src(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, EventMessageSource src) {
-    fprintf(stderr, "[MQ] EXT send mq=%p msg=%p src=%d\n", (void*)mq, (void*)msg, (int)src);
-    // Deliver the message directly from the external thread. This immediately writes it into
-    // the game's message queue and schedules any game thread blocked on receiving from it,
-    // which is required for external events (VI/AI/SP/DP/etc.) to wake a blocked game thread.
-    // The external_messages queue is only a fallback if the direct delivery fails (queue full).
-    if (external_rdram != nullptr && do_send(external_rdram, mq, msg, jam, false)) {
-        return;
-    }
     external_messages.enqueue({mq, msg, jam, requeue_enabled[static_cast<int>(src)]});
 }
 
 void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
-    // Deliver directly if possible so blocked game threads wake immediately.
-    if (external_rdram != nullptr && do_send(external_rdram, mq, msg, jam, false)) {
-        return;
-    }
     external_messages.enqueue({mq, msg, jam, requeue_if_blocked});
 }
 
