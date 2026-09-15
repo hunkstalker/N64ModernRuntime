@@ -869,11 +869,12 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         if (hc0 != nullptr) {
             uint32_t r16 = (uint32_t)hc0->r16;
             uint32_t tgt = (uint32_t)addr;
-            if (r16 != hh_last_r16) {
+            bool interes = ((r16 & 0xFFFF0000u) == 0x80030000u) || ((hh_last_r16 & 0xFFFF0000u) == 0x80030000u);
+            if (interes && r16 != hh_last_r16) {
                 static FILE* sf = nullptr;
                 static long total = 0;
                 if (sf == nullptr) sf = fopen("hh_s0.log", "w");
-                if (sf != nullptr && total < (64L * 1024 * 1024)) {
+                if (sf != nullptr && total < (16L * 1024 * 1024)) {
                     total += fprintf(sf, "[S0] prev=%08X new=%08X r16: %08X -> %08X\n",
                                      hh_last_tgt, tgt, hh_last_r16, r16);
                     fflush(sf);
