@@ -354,6 +354,7 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
     // HH: completación dirigida pendiente para este hilo (la entrega el do_send dirigido).
     if (take_pending_completion(PASS_RDRAM ultramodern::this_thread(), mq_, msg_)) {
         hh_mqlog(PASS_RDRAM "recv-pend", mq_, NULLPTR, 0);
+        hh_mqa_log(PASS_RDRAM "recv-pend", mq_, msg_ != NULLPTR ? *TO_PTR(OSMesg, msg_) : 0, 0);
         return true;
     }
     if (!block) {

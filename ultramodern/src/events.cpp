@@ -160,6 +160,9 @@ ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
 // lo trunque el logger de colas. Sirve para cazar el cuelgue por dano (el hilo VI deja de entregar).
 extern uint64_t total_vis;
 
+// HH: base de RDRAM para diagnosticos fuera de este TU (p. ej. el dispatch del bucle principal).
+extern "C" uint8_t* hh_get_rdram_base(void) { return events_context.rdram; }
+
 extern "C" void hh_evt_log(const char* what, int event_id, PTR(OSMesgQueue) mq_, OSMesg msg, unsigned long long vi, int tid) {
     if (getenv("HH_MQLOG_ALL") == nullptr) return;
     static FILE* f = nullptr;

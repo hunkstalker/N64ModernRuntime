@@ -848,13 +848,34 @@ static void hh_wrap_FUN_80000ed0(uint8_t* rdram, recomp_context* ctx) {
 // HH: declaraciones para el registro de llamadas (diagnostico de pila).
 extern "C" int hh_watch_active;
 extern "C" recomp_context* hh_get_current_ctx(void);
+extern "C" uint8_t* hh_get_rdram_base(void);
 extern "C" void hh_ring_record(uint32_t target, uint32_t sp);
 extern "C" void hh_ring2_record(uint32_t target, uint32_t sp);
 extern "C" void hh_callring_record(uint32_t addr);
+extern "C" recomp_context* hh_get_current_ctx(void);
+extern "C" uint8_t* hh_get_rdram_base(void);
 
 extern "C" recomp_func_t * get_function(int32_t addr) {
     hh_calltrace((uint32_t)addr);
     hh_callring_record((uint32_t)addr);
+    // HH: vigilancia del dispatch del bucle principal (livelock del dano): registra, en cada
+    // llamada al frame (0x80001454) o al no-op (0x80001BB0), el registro s0 (r16) y el valor de
+    // memoria que consulta el branch (lhu 0x0(s0)). Gated por HH_MQLOG_ALL.
+    if (((uint32_t)addr == 0x80001454u || (uint32_t)addr == 0x80001BB0u) && getenv("HH_MQLOG_ALL") != nullptr) {
+        recomp_context* hc = hh_get_current_ctx();
+        uint32_t s0 = hc != nullptr ? (uint32_t)hc->r16 : 0;
+        uint32_t flag = 0;
+        uint8_t* rdram_base = hh_get_rdram_base();
+        if (rdram_base != nullptr && s0 >= 0x80000000u && s0 + 2 <= 0x80800000u) {
+            flag = *(uint16_t*)(rdram_base + (s0 - 0x80000000u));
+        }
+        static FILE* df = nullptr;
+        if (df == nullptr) df = fopen("hh_disp.log", "w");
+        if (df != nullptr) {
+            fprintf(df, "[DISP] tgt=%08X s0=%08X flag=%04X\n", (unsigned)addr, s0, flag);
+            fflush(df);
+        }
+    }
     // HH: registrar (target, sp) de cada llamada para diagnosticar hundimientos de pila.
     if (hh_watch_active) {
         recomp_context* hh_c = hh_get_current_ctx();
