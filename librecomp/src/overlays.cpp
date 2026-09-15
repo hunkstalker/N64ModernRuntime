@@ -857,6 +857,7 @@ extern "C" uint8_t* hh_get_rdram_base(void);
 
 static thread_local uint32_t hh_last_r16 = 0xFFFFFFFFu;
 static thread_local uint32_t hh_last_tgt = 0;
+static thread_local bool hh_main_seen = false;
 
 extern "C" recomp_func_t * get_function(int32_t addr) {
     hh_calltrace((uint32_t)addr);
@@ -869,7 +870,8 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         if (hc0 != nullptr) {
             uint32_t r16 = (uint32_t)hc0->r16;
             uint32_t tgt = (uint32_t)addr;
-            bool interes = ((r16 & 0xFFFF0000u) == 0x80030000u) || ((hh_last_r16 & 0xFFFF0000u) == 0x80030000u);
+            if (r16 == 0x80037748u || hh_last_r16 == 0x80037748u) hh_main_seen = true;
+            bool interes = hh_main_seen;
             if (interes && r16 != hh_last_r16) {
                 static FILE* sf = nullptr;
                 static long total = 0;
