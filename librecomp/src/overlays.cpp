@@ -876,7 +876,7 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
                 static FILE* sf = nullptr;
                 static long total = 0;
                 if (sf == nullptr) sf = fopen("hh_s0.log", "w");
-                if (sf != nullptr && total < (16L * 1024 * 1024)) {
+                if (sf != nullptr && total < (32L * 1024 * 1024)) {
                     total += fprintf(sf, "[S0] prev=%08X new=%08X r16: %08X -> %08X\n",
                                      hh_last_tgt, tgt, hh_last_r16, r16);
                     fflush(sf);
