@@ -855,9 +855,34 @@ extern "C" void hh_callring_record(uint32_t addr);
 extern "C" recomp_context* hh_get_current_ctx(void);
 extern "C" uint8_t* hh_get_rdram_base(void);
 
+static thread_local uint32_t hh_last_r16 = 0xFFFFFFFFu;
+static thread_local uint32_t hh_last_tgt = 0;
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
     hh_calltrace((uint32_t)addr);
     hh_callring_record((uint32_t)addr);
+    // HH: vigila cambios de r16 (s0) entre llamadas guest. El cuelgue por dano: s0 se machaca a
+    // 0x1E82 y el dispatch frame/no-op del bucle principal se rompe. Loguea SOLO los cambios con
+    // la funcion anterior (la culpable) y la actual. Gated por HH_MQLOG_ALL -> hh_s0.log.
+    if (getenv("HH_MQLOG_ALL") != nullptr) {
+        recomp_context* hc0 = hh_get_current_ctx();
+        if (hc0 != nullptr) {
+            uint32_t r16 = (uint32_t)hc0->r16;
+            uint32_t tgt = (uint32_t)addr;
+            if (r16 != hh_last_r16) {
+                static FILE* sf = nullptr;
+                static long total = 0;
+                if (sf == nullptr) sf = fopen("hh_s0.log", "w");
+                if (sf != nullptr && total < (64L * 1024 * 1024)) {
+                    total += fprintf(sf, "[S0] prev=%08X new=%08X r16: %08X -> %08X\n",
+                                     hh_last_tgt, tgt, hh_last_r16, r16);
+                    fflush(sf);
+                }
+                hh_last_r16 = r16;
+            }
+            hh_last_tgt = tgt;
+        }
+    }
     // HH: vigilancia del dispatch del bucle principal (livelock del dano): registra, en cada
     // llamada al frame (0x80001454) o al no-op (0x80001BB0), el registro s0 (r16) y el valor de
     // memoria que consulta el branch (lhu 0x0(s0)). Gated por HH_MQLOG_ALL.
