@@ -2,9 +2,13 @@
 #include <fstream>
 #include <array>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <mutex>
+#include <chrono>
 #include "recomp.h"
+#include <cstdarg>
 #include "librecomp/addresses.hpp"
 #include "librecomp/game.hpp"
 #include "librecomp/files.hpp"
@@ -12,6 +16,9 @@
 #include <ultramodern/ultramodern.hpp>
 
 static std::vector<uint8_t> rom;
+
+// HH: watchpoint de escrituras (ver recomp.cpp). Avisa si un DMA toca el rango vigilado.
+extern "C" void hh_watch_dma(uint32_t dram, uint32_t size);
 
 bool recomp::is_rom_loaded() {
     return !rom.empty();
@@ -266,9 +273,49 @@ void ultramodern::join_saving_thread() {
     }
 }
 
+// HH: log siempre-activo del camino PI (hh_pi.log, acotado) para diagnosticar cuelgues tipo
+// "el juego espera una completacion de DMA que no llega". Cada linea lleva t= (segundos desde el
+// primer DMA) para poder alinear con hh_state.log. Limite: HH_PI_MAX bytes (defecto 32 MB).
+static void hh_pi_log(const char* fmt, ...) {
+    static FILE* f = nullptr;
+    static long total = 0;
+    static long max_total = -1;
+    static std::chrono::steady_clock::time_point t0{};
+    if (f == nullptr) {
+        f = fopen("hh_pi.log", "w");
+        if (f == nullptr) return;
+        const char* env = getenv("HH_PI_MAX");
+        max_total = (env != nullptr && *env != '\0') ? atol(env) : (32L * 1024 * 1024);
+        t0 = std::chrono::steady_clock::now();
+    }
+    if (total > max_total) return;
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    va_list args;
+    va_start(args, fmt);
+    total += fprintf(f, "[PI] t=%.3f ", t);
+    total += vfprintf(f, fmt, args);
+    va_end(args);
+    fflush(f);
+}
+
 void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
     // TODO asynchronous transfer
     // TODO implement unaligned DMA correctly
+    const char* region = (physical_addr >= recomp::rom_base) ? "rom"
+                       : (physical_addr >= recomp::sram_base) ? "sram" : "DESCONOCIDA";
+    uint32_t tid = 0xFFFFFFFFu;
+    if (ultramodern::is_game_thread()) {
+        tid = (uint32_t)TO_PTR(OSThread, ultramodern::this_thread())->id;
+    }
+    hh_pi_log("tid=%u dir=%u dev=%08X phys=%08X dram=%08X size=%X mq=%08X region=%s\n",
+              tid, direction, physical_addr, physical_addr, (uint32_t)rdram_address, size,
+              (uint32_t)mq, region);
+    // HH: si hay watchpoint activo, avisar si este DMA toca el rango vigilado.
+    hh_watch_dma((uint32_t)rdram_address, size);
+    if (getenv("HH_PILOG") != nullptr) {
+        fprintf(stderr, "[PI] do_dma mq=%p dram=0x%08X phys=0x%08X size=0x%X dir=%u\n",
+                (void*)mq, (uint32_t)rdram_address, physical_addr, size, direction);
+    }
     if (direction == 0) {
         if (physical_addr >= recomp::rom_base) {
             // read cart rom

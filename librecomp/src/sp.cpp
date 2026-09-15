@@ -36,12 +36,30 @@ extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
     ultramodern::submit_rsp_task(rdram, ctx->r4);
 }
 
+// El juego usa el protocolo de yield de libultra para alternar gfx/audio en el RSP:
+// t18 llama osSpTaskYield mientras t17 tiene una task en vuelo y luego espera la
+// completacion SP. Con el reparto dirigido del port, esa completacion va al emisor
+// (t17), asi que el que hace yield se quedaria esperando para siempre. Entregamos una
+// completacion SP sintetica al hilo que hace yield (la task real completa por su lado).
+extern void sp_complete(PTR(OSThread) submitter);
 extern "C" void osSpTaskYield_recomp(uint8_t* rdram, recomp_context* ctx) {
-    // Ignore yield requests (acts as if the task completed before it received the yield request)
+    const char* dbg = getenv("HH_VERBOSE");
+    static const bool shared = getenv("HH_SP_SHARED") != nullptr;
+    static uint64_t n = 0;
+    if (dbg && n < 200) fprintf(stderr, "[YLD] yield n=%llu shared=%d\n", (unsigned long long)n, (int)shared);
+    n++;
+    if (!shared) {
+        sp_complete(ultramodern::this_thread());
+    }
 }
 
 extern "C" void osSpTaskYielded_recomp(uint8_t* rdram, recomp_context* ctx) {
-    // Task yield requests are ignored, so always return 0 as tasks will never be yielded
+    const char* dbg = getenv("HH_VERBOSE");
+    static uint64_t n = 0;
+    uint32_t task = (uint32_t)ctx->r4;
+    uint32_t flags = task ? *(uint32_t*)&rdram[(task + 4) & 0x7FFFFF] : 0;
+    if (dbg && n < 200) fprintf(stderr, "[YLD] yielded n=%llu task=%08X flags=%08X\n", (unsigned long long)n, task, flags);
+    n++;
     ctx->r2 = 0;
 }
 

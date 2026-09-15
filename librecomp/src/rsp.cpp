@@ -1,6 +1,7 @@
 #include <cassert>
 #include <cstring>
 #include <cinttypes>
+#include <cstdlib>
 
 #include "rsp.hpp"
 
@@ -38,7 +39,17 @@ bool recomp::rsp::run_task(uint8_t* rdram, const OSTask* task) {
     RspUcodeFunc* ucode_func = rsp_callbacks.get_rsp_microcode(task);
 
     if (ucode_func == nullptr) {
-        fprintf(stderr, "No registered RSP ucode for %" PRIu32 " (returned `nullptr`)\n", task->t.type);
+        // Tasks without a registered ucode (e.g. the game's audio ucode) are completed as no-ops
+        // by the task thread. Warn once per task type, and only in verbose mode, to avoid spamming
+        // the console every frame.
+        static bool warned[64] = {};
+        uint32_t type = static_cast<uint32_t>(task->t.type);
+        if (type < 64 && !warned[type]) {
+            warned[type] = true;
+            if (getenv("HH_VERBOSE") != nullptr) {
+                fprintf(stderr, "No registered RSP ucode for %" PRIu32 " (returned `nullptr`)\n", type);
+            }
+        }
         return false;
     }
 

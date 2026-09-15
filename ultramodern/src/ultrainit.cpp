@@ -29,5 +29,5 @@ void ultramodern::preinit(RDRAM_ARG ultramodern::renderer::WindowHandle window_h
     ultramodern::init_thread_cleanup();
 }
 
-extern "C" void osInitialize() {
+extern "C" void osInitialize_stub() {
 }

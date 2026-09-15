@@ -26,7 +26,12 @@ void ultramodern::events::set_callbacks(const ultramodern::events::callbacks_t& 
 
 struct SpTaskAction {
     OSTask task;
+    PTR(OSThread) submitter; // HH: hilo que envió la task (para la completación dirigida)
 };
+
+// HH: task RSP en vuelo (no-gfx) -> hilo emisor, para entregarle su completación SP.
+static std::mutex sp_submitter_mutex;
+static std::unordered_map<uint32_t, PTR(OSThread)> sp_task_submitters;
 
 struct ScreenUpdateAction {
     ultramodern::renderer::ViRegs regs;
@@ -152,7 +157,7 @@ ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
 
 extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_, OSMesg msg) {
     std::lock_guard lock{ events_context.message_mutex };
-    fprintf(stderr, "[EV] osSetEventMesg event=%d mq=%p msg=%p\n", (int)event_id, (void*)mq_, (void*)msg);
+    HH_LOG("[EV] osSetEventMesg event=%d mq=%p msg=%p\n", (int)event_id, (void*)mq_, (void*)msg);
 
     switch (event_id) {
         case OS_EVENT_SP:
@@ -176,18 +181,53 @@ extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_,
             events_context.vi_event.mq = mq_;
             break;
     }
-}
 
-extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 retrace_count) {
-    fprintf(stderr, "[VIEV] osViSetEvent mq=%p msg=%p retrace=%u\n", (void*)mq_, (void*)msg, retrace_count);
-    std::lock_guard lock{ events_context.message_mutex };
-    ViState* next_state = events_context.vi.get_next_state();
-    next_state->mq = mq_;
-    next_state->msg = msg;
-    next_state->retrace_count = retrace_count;
+    // Mirror the ROM libultra bookkeeping: __osEventStateTab[event_id] = { mq, msg }.
+    // The game reads this table directly at 0x800CD5F0 + event_id * 8; the runtime replaces
+    // osSetEventMesg with this C++ version, so the table has to be written here too.
+    if (event_id < 24) {
+        uint32_t addr = 0xCD5F0 + (uint32_t)event_id * 8;
+        *reinterpret_cast<uint32_t*>(&rdram[addr]) = static_cast<uint32_t>(mq_);
+        *reinterpret_cast<uint32_t*>(&rdram[addr + 4]) = static_cast<uint32_t>(msg);
+    }
 }
 
 uint64_t total_vis = 0;
+
+// HH: latido del hilo de VI del runtime (para el watchdog de cuelgue del port).
+static std::atomic<uint64_t> hh_vi_ticks{0};
+extern "C" uint64_t hh_get_vi_ticks() { return hh_vi_ticks.load(); }
+
+// HH: contador de VI (frames de juego) expuesto para el replay determinista de input.
+extern "C" uint64_t hh_get_vi_count(void) { return total_vis; }
+
+// ADR 0003: el OSViContext y los registros VI los mantiene libultra del ROM
+// (viMgrMain -> __osViSwapContext). El runtime solo lee el bloque de registros MMIO
+// (KSEG1 0x04400000) para alimentar ViRegs/RT64. Devuelve false mientras el ROM no los
+// haya inicializado (VI_CTRL == 0), en cuyo caso se usa el modo dummy.
+static bool load_vi_regs(uint8_t* rdram, ultramodern::renderer::ViRegs& regs) {
+    constexpr uint32_t VI_BASE = 0x20000000u + 0x04400000u;
+    auto r = [&](uint32_t off) { return *(uint32_t*)&rdram[VI_BASE + off]; };
+    uint32_t status = r(0x00);
+    if (status == 0) {
+        return false;
+    }
+    regs.VI_STATUS_REG = status;
+    regs.VI_ORIGIN_REG = r(0x04);
+    regs.VI_WIDTH_REG = r(0x08);
+    regs.VI_INTR_REG = r(0x0C);
+    regs.VI_V_CURRENT_LINE_REG = r(0x10);
+    regs.VI_TIMING_REG = r(0x14);
+    regs.VI_V_SYNC_REG = r(0x18);
+    regs.VI_H_SYNC_REG = r(0x1C);
+    regs.VI_LEAP_REG = r(0x20);
+    regs.VI_H_START_REG = r(0x24);
+    regs.VI_V_START_REG = r(0x28);
+    regs.VI_V_BURST_REG = r(0x2C);
+    regs.VI_X_SCALE_REG = r(0x30);
+    regs.VI_Y_SCALE_REG = r(0x34);
+    return true;
+}
 
 
 extern std::atomic_bool exited;
@@ -202,9 +242,8 @@ void vi_thread_func() {
     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Critical);
     using namespace std::chrono_literals;
 
-    int remaining_retraces = 1;
-
     while (!exited) {
+        hh_vi_ticks.fetch_add(1, std::memory_order_relaxed);
         // Determine the next VI time (more accurate than adding 16ms each VI interrupt)
         auto next = ultramodern::get_start() + (total_vis * 1000000us) / (60 * ultramodern::get_speed_multiplier());
         //if (next > std::chrono::high_resolution_clock::now()) {
@@ -242,39 +281,144 @@ void vi_thread_func() {
         // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
         events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
 
-        // Update VI registers and swap VI modes.
-        events_context.vi.update_vi();
+        // ADR 0003: con el subsistema VI del ROM activo, los registros los escribe
+        // __osViSwapContext; el runtime solo los lee. Hasta que el ROM los inicialice,
+        // se mantiene el modo dummy (set_dummy_vi + update_vi).
+        static bool rom_vi_active = false;
+        if (!rom_vi_active && ultramodern::is_game_started()) {
+            rom_vi_active = load_vi_regs(events_context.rdram, events_context.vi.regs);
+        }
+        if (rom_vi_active) {
+            load_vi_regs(events_context.rdram, events_context.vi.regs);
+        } else {
+            events_context.vi.update_vi();
+        }
 
         // If the game has started, handle sending VI and AI events.
         if (ultramodern::is_game_started()) {
-            remaining_retraces--;
-            
-            std::lock_guard lock{ events_context.message_mutex };
-            ViState* cur_state = events_context.vi.get_cur_state();
-            if (remaining_retraces == 0) {
-                if (cur_state->mq != NULLPTR) {
-                    fprintf(stderr, "[EV] VI retrace fire mq=%p\n", (void*)cur_state->mq);
-                    // Send a message to the VI queue, and do not set it to be requeued if the queue was full.
-                    // The worst case scenario is that the game misses a VI message and has to wait a little longer for the next. 
-                    ultramodern::enqueue_external_message_src(cur_state->mq, cur_state->msg, false, ultramodern::EventMessageSource::Vi);
-                } else {
-                    fprintf(stderr, "[EV] VI retrace fire but mq=NULLPTR\n");
-                }
-                // The game may have registered the VI interrupt via osSetEventMesg(OS_EVENT_VI=7) instead of osViSetEvent.
+            {
+                std::lock_guard lock{ events_context.message_mutex };
+                // Interrupt VI de hardware: lo consume viMgrMain (osCreateViManager lo registró
+                // con osSetEventMesg(OS_EVENT_VI)). La entrega al juego la hace el ROM.
                 if (events_context.vi_event.mq != NULLPTR) {
                     ultramodern::enqueue_external_message_src(events_context.vi_event.mq, events_context.vi_event.msg, false, ultramodern::EventMessageSource::Vi);
+                }
+                // HH diag: vigilancia de los contextos de audio (voice+0x60/+0x64/+0x5C) y de la
+                // tabla de voces (0x80091BE0..) para localizar la corrupcion del descriptor.
+                if (getenv("HH_CTXWATCH") != nullptr) {
+                    uint8_t* g = events_context.rdram;
+                    struct { const char* name; uint32_t addr; } fields[] = {
+                        { "v1+60", 0x800C7A50 }, { "v1+64", 0x800C7A54 }, { "v1+5C", 0x800C7A5C },
+                        { "v2+60", 0x800C8A40 }, { "v2+64", 0x800C8A44 }, { "v2+5C", 0x800C8A4C },
+                        { "v3+60", 0x800C9A30 }, { "v3+64", 0x800C9A34 }, { "v3+5C", 0x800C9A3C },
+                        { "tbl0",  0x80091BE0 }, { "tbl1",  0x80091BE4 }, { "tbl2",  0x80091BE8 },
+                    };
+                    static uint32_t prev[12];
+                    static bool init = false;
+                    for (unsigned i = 0; i < 12; i++) {
+                        uint32_t v = *(uint32_t*)&g[fields[i].addr & 0x1FFFFFFF];
+                        if (!init || v != prev[i]) {
+                            fprintf(stderr, "[CTXW] vis=%llu %s=%08X (antes %08X)\n",
+                                    (unsigned long long)total_vis, fields[i].name, v, init ? prev[i] : 0);
+                            prev[i] = v;
+                        }
+                    }
+                    init = true;
+                }
+                // HH diag: vigilancia del objeto RSP (0x8005C4B0) para el crash del driver.
+                if (getenv("HH_WATCH59") != nullptr) {
+                    uint8_t* g = events_context.rdram;
+                    auto rw = [&](uint32_t a){ return *(uint32_t*)&g[a]; };
+                    static uint32_t p0 = 0, p4 = 0, p8 = 0, pc = 0;
+                    uint32_t v0 = rw(0x5C4B0), v4 = rw(0x5C4B4), v8 = rw(0x5C4B8), vc = rw(0x5C4BC);
+                    if (v0 != p0) { fprintf(stderr, "[W59] vis=%llu +0=%08X (antes %08X)\n", (unsigned long long)total_vis, v0, p0); p0 = v0; }
+                    if (v4 != p4) { fprintf(stderr, "[W59] vis=%llu +4=%08X (antes %08X)\n", (unsigned long long)total_vis, v4, p4); p4 = v4; }
+                    if (v8 != p8) { fprintf(stderr, "[W59] vis=%llu +8=%08X (antes %08X)\n", (unsigned long long)total_vis, v8, p8); p8 = v8; }
+                    if (vc != pc) { fprintf(stderr, "[W59] vis=%llu +C=%08X (antes %08X)\n", (unsigned long long)total_vis, vc, pc); pc = vc; }
+                }
+                // GATE: traza de cambios del contador de tareas RSP pendientes (0x8005CD4C).
+                if (ultramodern::debug::verbose()) {
+                    uint8_t* g = events_context.rdram;
+                    uint32_t c = *(uint32_t*)&g[0x5CD4C];
+                    static uint32_t prev_cd4c = 0;
+                    static bool cd4c_init = false;
+                    if (!cd4c_init || c != prev_cd4c) {
+                        fprintf(stderr, "[GATE] vis=%llu cd4c=%u\n", (unsigned long long)total_vis, c);
+                        prev_cd4c = c;
+                        cd4c_init = true;
+                    }
                 }
                 // DUMP: render-mode state of the game (DAT_80037750 / DAT_80037730 / DAT_80037738)
                 if ((total_vis % 60) == 0) {
                     uint8_t* g = events_context.rdram;
                     auto rd = [&](uint32_t a){ return *(uint32_t*)&g[a & 0x1FFFFFFF]; };
-                    fprintf(stderr, "[RND] vis=%llu 3750=0x%08X 3730=0x%08X 3738=0x%08X 3734=0x%08X 373c=0x%08X\n",
-                        (unsigned long long)total_vis, rd(0x80037750), rd(0x80037730), rd(0x80037738), rd(0x80037734), rd(0x8003773c));
+                    auto rdu16 = [&](uint32_t a){ return *(uint16_t*)&g[(a ^ 2) & 0x1FFFFFFF]; };
+                    auto rdu8 = [&](uint32_t a){ return g[(a ^ 3) & 0x1FFFFFFF]; };
+                    HH_LOG("[RND] vis=%llu 3750=0x%08X 3730=0x%08X 3738=0x%08X 3734=0x%08X 373c=0x%08X fe00=0x%04X fe02=0x%02X node=%08X n0=%08X n14=%08X n18=%08X n1C=%08X v478=%08X f545=%02X f544=%02X d550=%02X ld14=%08X ld18=%08X ld1C=%08X ld20=%08X cd4c=%u t17q=%08X t17n=%08X t16q=%08X mqr=%08X mqs=%08X mqv=%u req=%08X q158r=%08X q158v=%u t19q=%08X\n",
+                        (unsigned long long)total_vis, rd(0x80037750), rd(0x80037730), rd(0x80037738), rd(0x80037734), rd(0x8003773c),
+                        rdu16(0x801CFE00), rdu8(0x801CFE02),
+                        rd(0x801D03C0), rd(0x801D03C0), rd(0x801D03D4), rd(0x801D03D8), rd(0x801D03DC), rd(0x80089478),
+                        rdu8(0x8008D545), rdu8(0x8008D544), rdu8(0x8008D550),
+                        rd(0x8005D014), rd(0x8005D018), rd(0x8005D01C), rd(0x8005D020),
+                        rd(0x8005CD4C), rd(0x8005C9D8 + 8), rd(0x8005C9D8), rd(0x8005CB88 + 8),
+                        rd(0x8005C4F0), rd(0x8005C4F4), rd(0x8005C4F8),
+                        rd(0x8005C4B0 + 0x888), rd(0x8005C608), rd(0x8005C608 + 8), rd(0x8005C678 + 8));
                 }
-                remaining_retraces = cur_state->retrace_count;
+                {
+                    // HH_DUMP_VI admite lista separada por comas (p. ej. "3000,4500,5400").
+                    static bool dumpvi_parsed = false;
+                    static unsigned long long dumpvi_list[32];
+                    static int dumpvi_count = 0;
+                    if (!dumpvi_parsed) {
+                        dumpvi_parsed = true;
+                        const char* dumpvi = getenv("HH_DUMP_VI");
+                        if (dumpvi != nullptr) {
+                            char buf[512];
+                            strncpy(buf, dumpvi, sizeof(buf) - 1);
+                            buf[sizeof(buf) - 1] = 0;
+                            for (char* tok = strtok(buf, ","); tok != nullptr && dumpvi_count < 32; tok = strtok(nullptr, ",")) {
+                                dumpvi_list[dumpvi_count++] = strtoull(tok, nullptr, 0);
+                            }
+                        }
+                    }
+                    for (int i = 0; i < dumpvi_count; i++) {
+                        if (dumpvi_list[i] != total_vis) continue;
+                        uint8_t* g = events_context.rdram;
+                        char path[512];
+                        snprintf(path, sizeof(path), "/app/hybrid-heaven-recomp/work/debug/port_vi%llu.bin", (unsigned long long)total_vis);
+                        FILE* f = fopen(path, "wb");
+                        if (f) { fwrite(g, 1, 0x800000, f); fclose(f); fprintf(stderr, "[DUMP] VI %llu -> %s\n", (unsigned long long)total_vis, path); }
+                        break;
+                    }
+                }
+                // Per-frame evolution of the boot object (HH debug): +0x00..+0x2C.
+                if (ultramodern::debug::verbose()) {
+                    uint8_t* g = events_context.rdram;
+                    auto rdw = [&](uint32_t a){ return *(uint32_t*)&g[a & 0x1FFFFFFF]; };
+                    HH_LOG("[OBJ] vis=%llu %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                        (unsigned long long)total_vis,
+                        rdw(0x801D03C0), rdw(0x801D03C4), rdw(0x801D03C8), rdw(0x801D03CC),
+                        rdw(0x801D03D0), rdw(0x801D03D4), rdw(0x801D03D8), rdw(0x801D03DC),
+                        rdw(0x801D03E0), rdw(0x801D03E4), rdw(0x801D03E8), rdw(0x801D03EC));
+                }
+                if (ultramodern::debug::verbose()) {
+                    uint8_t* g = events_context.rdram;
+                    auto rd16 = [&](uint32_t a){ return *(uint16_t*)&g[(a ^ 2) & 0x1FFFFFFF]; };
+                    auto rd32 = [&](uint32_t a){ return *(uint32_t*)&g[a & 0x1FFFFFFF]; };
+                    HH_LOG("[TBL] vis=%llu %04X:%08X %04X:%08X %04X:%08X %04X:%08X\n",
+                        (unsigned long long)total_vis,
+                        rd16(0x8008DFC0), rd32(0x8008DFC4),
+                        rd16(0x8008DFC8), rd32(0x8008DFCC),
+                        rd16(0x8008DFD0), rd32(0x8008DFD4),
+                        rd16(0x8008DFD8), rd32(0x8008DFDC));
+                }
             }
             if (events_context.ai.mq != NULLPTR) {
                 // Send a message to the VI queue, and do not set it to be requeued if the queue was full for the same reason as the VI message above.
+                static uint64_t ai_fires = 0;
+                if ((ai_fires++ % 60) == 0) {
+                    HH_LOG("[AIEV] fire n=%llu vis=%llu mq=%p\n", (unsigned long long)ai_fires, (unsigned long long)total_vis, (void*)events_context.ai.mq);
+                }
                 ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
             }
         }
@@ -285,16 +429,32 @@ void vi_thread_func() {
     }
 }
 
-void sp_complete() {
+// HH: completación dirigida al hilo que envió la task (si sigue bloqueado en el evento);
+// el juego tiene varios hilos (16/17/18) esperando el mismo mq SP/DP y el reparto por lista
+// podía entregar la completación al hilo equivocado (deadlock del gate, ver nota 2026-09-13).
+void sp_complete(PTR(OSThread) submitter = NULLPTR) {
     uint8_t* rdram = events_context.rdram;
     std::lock_guard lock{ events_context.message_mutex };
-    ultramodern::enqueue_external_message_src(events_context.sp.mq, events_context.sp.msg, false, ultramodern::EventMessageSource::Sp);
+    // HH_SP_SHARED: semantica libultra (cola de evento compartida): la completacion la consume
+    // cualquier waiter (el protocolo de yield del juego lo requiere). Sin el knob se mantiene el
+    // reparto dirigido al emisor (fix del deadlock del gate).
+    static const bool shared = getenv("HH_SP_SHARED") != nullptr;
+    if (shared) {
+        submitter = NULLPTR;
+    }
+    HH_LOG("[SPC] fire mq=%p msg=%p target=%p\n", (void*)events_context.sp.mq, (void*)events_context.sp.msg, (void*)submitter);
+    ultramodern::enqueue_external_message_to(events_context.sp.mq, events_context.sp.msg, false, submitter);
 }
 
-void dp_complete() {
+void dp_complete(PTR(OSThread) submitter = NULLPTR) {
     uint8_t* rdram = events_context.rdram;
     std::lock_guard lock{ events_context.message_mutex };
-    ultramodern::enqueue_external_message_src(events_context.dp.mq, events_context.dp.msg, false, ultramodern::EventMessageSource::Dp);
+    static const bool shared = getenv("HH_SP_SHARED") != nullptr;
+    if (shared) {
+        submitter = NULLPTR;
+    }
+    HH_LOG("[DP] dp_complete -> mq=%p msg=%p target=%p\n", (void*)events_context.dp.mq, (void*)events_context.dp.msg, (void*)submitter);
+    ultramodern::enqueue_external_message_to(events_context.dp.mq, events_context.dp.msg, false, submitter);
 }
 
 void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready) {
@@ -312,6 +472,19 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
         if (task == nullptr) {
             return;
         }
+        // HH: recuperar el hilo emisor de esta task (si lo registró submit_rsp_task).
+        PTR(OSThread) submitter = NULLPTR;
+        {
+            std::lock_guard lock{ sp_submitter_mutex };
+            // Clave por offset de rdram: (uint8_t*)task - rdram == PTR - 0xFFFFFFFF80000000.
+            uint32_t task_key = (uint32_t)((uint8_t*)task - rdram);
+            auto it = sp_task_submitters.find(task_key);
+            if (it != sp_task_submitters.end()) {
+                submitter = it->second;
+                sp_task_submitters.erase(it);
+            }
+        }
+        HH_LOG("[SPTHR] deq task=%p type=%u target=%p\n", (void*)task, (unsigned)task->t.type, (void*)submitter);
 
         // Execute the RSP task. Tasks without a registered ucode (p. ej. audio, M_AUDTASK=2) se
         // tratan como no-op: se completa igualmente para que el juego avance (audio dummy).
@@ -320,12 +493,13 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
             uint32_t t = static_cast<uint32_t>(task->t.type);
             if (t < 64 && !warned[t]) {
                 warned[t] = true;
-                fprintf(stderr, "[RSP] sin ucode para task type %u -> no-op (dummy)\n", t);
+                HH_LOG("[RSP] sin ucode para task type %u -> no-op (dummy)\n", t);
             }
         }
+        HH_LOG("[SPTHR] done task=%p\n", (void*)task);
 
-        // Tell the game that the RSP has completed
-        sp_complete();
+        // Tell the game that the RSP has completed (al hilo emisor, si está bloqueado)
+        sp_complete(submitter);
     }
 }
 
@@ -399,7 +573,6 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
                 // is finished as well, so sending this early shouldn't be an issue in most cases.
                 // If this causes issues then the logic can be replaced with responding to yield requests.
-                sp_complete();
                 ultramodern::measure_input_latency();
 
                 PTR(u64) displaylist = task_action->task.t.data_ptr;
@@ -409,7 +582,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 renderer_context->send_dl(&task_action->task);
                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
 
-                dp_complete();
+                dp_complete(task_action->submitter);
                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
                 ultramodern::extensions::on_displaylist_parsed(displaylist);
                 ultramodern::extensions::on_displaylist_completed(displaylist);
@@ -490,77 +663,9 @@ void set_dummy_vi(bool odd) {
     }
 }
 
-extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
-    std::lock_guard lock{ events_context.message_mutex };
-    events_context.vi.get_next_state()->framebuffer = frameBufPtr;
-}
-
-extern "C" void osViSetMode(RDRAM_ARG PTR(OSViMode) mode_) {
-    std::lock_guard lock{ events_context.message_mutex };
-    OSViMode* mode = TO_PTR(OSViMode, mode_);
-    ViState* next_state = events_context.vi.get_next_state();
-    next_state->mode = mode;
-    next_state->control = next_state->mode->comRegs.ctrl;
-}
-
-#define OS_VI_GAMMA_ON          0x0001
-#define OS_VI_GAMMA_OFF         0x0002
-#define OS_VI_GAMMA_DITHER_ON   0x0004
-#define OS_VI_GAMMA_DITHER_OFF  0x0008
-#define OS_VI_DIVOT_ON          0x0010
-#define OS_VI_DIVOT_OFF         0x0020
-#define OS_VI_DITHER_FILTER_ON  0x0040
-#define OS_VI_DITHER_FILTER_OFF 0x0080
-
-extern "C" void osViSetSpecialFeatures(uint32_t func) {
-    std::lock_guard lock{ events_context.message_mutex };
-    ViState* next_state = events_context.vi.get_next_state();
-    uint32_t* control_out = &next_state->control;
-    if ((func & OS_VI_GAMMA_ON) != 0) {
-        *control_out |= VI_CTRL_GAMMA_ON;
-    }
-
-    if ((func & OS_VI_GAMMA_OFF) != 0) {
-        *control_out &= ~VI_CTRL_GAMMA_ON;
-    }
-
-    if ((func & OS_VI_GAMMA_DITHER_ON) != 0) {
-        *control_out |= VI_CTRL_GAMMA_DITHER_ON;
-    }
-
-    if ((func & OS_VI_GAMMA_DITHER_OFF) != 0) {
-        *control_out &= ~VI_CTRL_GAMMA_DITHER_ON;
-    }
-
-    if ((func & OS_VI_DIVOT_ON) != 0) {
-        *control_out |= VI_CTRL_DIVOT_ON;
-    }
-
-    if ((func & OS_VI_DIVOT_OFF) != 0) {
-        *control_out &= ~VI_CTRL_DIVOT_ON;
-    }
-
-    if ((func & OS_VI_DITHER_FILTER_ON) != 0) {
-        *control_out |= VI_CTRL_DITHER_FILTER_ON;
-        *control_out &= ~VI_CTRL_ANTIALIAS_MASK;
-    }
-
-    if ((func & OS_VI_DITHER_FILTER_OFF) != 0) {
-        *control_out &= ~VI_CTRL_DITHER_FILTER_ON;
-        *control_out |= next_state->mode->comRegs.ctrl & VI_CTRL_ANTIALIAS_MASK;
-    }
-}
-
-extern "C" void osViBlack(uint8_t active) {
-    std::lock_guard lock{ events_context.message_mutex };
-    ViState* next_state = events_context.vi.get_next_state();
-    uint32_t* state_out = &next_state->state;
-    if (active) {
-        *state_out |= VI_STATE_BLACK;
-    } else {
-        *state_out &= ~VI_STATE_BLACK;
-    }
-}
+// osViSwapBuffer/osViSetMode/osViSetSpecialFeatures/osViBlack/osViGet*Framebuffer se generan
+// del ROM (ADR 0003): viMgrMain mantiene el OSViContext y __osViSwapContext escribe los registros.
+// El runtime solo conserva la emulación de hardware (temporización + ViRegs vía MMIO).
 
 extern "C" void osViRepeatLine(uint8_t active) {
     std::lock_guard lock{ events_context.message_mutex };
@@ -585,25 +690,33 @@ extern "C" void osViSetYScale(float scale) {
     }
 }
 
-extern "C" PTR(void) osViGetNextFramebuffer() {
-    return events_context.vi.get_next_state()->framebuffer;
-}
-
-extern "C" PTR(void) osViGetCurrentFramebuffer() {
-    return events_context.vi.get_cur_state()->framebuffer;
-}
-
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
 
-    fprintf(stderr, "[SPT] submit_rsp_task task=%p type=%d\n", (void*)task, (int)task->t.type);
+    HH_LOG("[SPT] submit_rsp_task task=%p type=%d ucode=0x%08llX data=0x%08llX datasize=0x%llX out=0x%08llX outsize=0x%llX\n",
+        (void*)task, (int)task->t.type,
+        (unsigned long long)task->t.ucode, (unsigned long long)task->t.data_ptr,
+        (unsigned long long)task->t.data_size, (unsigned long long)task->t.output_buff,
+        (unsigned long long)task->t.output_buff_size);
 
-    // Send gfx tasks to the graphics action queue
+    // HH: registrar el hilo emisor para entregarle su completación (SP/DP) a él y no al primero
+    // que esté esperando en el mq del evento. En gfx la task se procesa en el hilo de gráficos
+    // (copia), así que el registro se consume aquí mismo.
+    PTR(OSThread) submitter = ultramodern::this_thread();
     if (task->t.type == M_GFXTASK) {
-        events_context.action_queue.enqueue(SpTaskAction{ *task });
+        // El RSP del hardware completa al terminar de parsear la DL, independiente del RDP. Si
+        // esperamos al render de RT64 (lento en software) para el sp_complete, la task gfx queda
+        // "en vuelo" (+0x88C) ~80 ms y el driver de audio entra en yield constantemente (en el
+        // emulador no hay yields). Completamos el SP ya; el gfx thread hace send_dl + dp_complete.
+        sp_complete(submitter);
+        events_context.action_queue.enqueue(SpTaskAction{ *task, submitter });
     }
     // Set all other tasks as the RSP task
     else {
+        {
+            std::lock_guard lock{ sp_submitter_mutex };
+            sp_task_submitters[(uint32_t)((uint64_t)task_ - 0xFFFFFFFF80000000ULL)] = submitter;
+        }
         events_context.sp_task_queue.enqueue(task);
     }
 }

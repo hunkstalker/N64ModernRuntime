@@ -21,6 +21,18 @@
 #include "ultramodern/rsp.hpp"
 #include "ultramodern/threads.hpp"
 
+// HH-specific debug tracing. All verbose runtime traces are opt-in via `HH_VERBOSE=1` so normal
+// runs (and release builds) stay quiet and readable. Use HH_LOG(...) exactly like fprintf(stderr, ...).
+#include <cstdio>
+#include <cstdlib>
+namespace ultramodern { namespace debug {
+inline bool verbose() {
+    static const bool enabled = getenv("HH_VERBOSE") != nullptr;
+    return enabled;
+}
+} }
+#define HH_LOG(...) do { if (ultramodern::debug::verbose()) { fprintf(stderr, __VA_ARGS__); } } while (0)
+
 struct UltraThreadContext {
     std::thread host_thread;
     moodycamel::LightweightSemaphore running;
@@ -62,7 +74,9 @@ std::filesystem::path get_save_file_path();
 // Thread queues.
 constexpr PTR(PTR(OSThread)) running_queue = (PTR(PTR(OSThread)))-1;
 
-void thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue, PTR(OSThread) toadd);
+// HH: `fifo_equals=true` (usado al ceder el CPU en swap_to_thread) inserta los empates de prioridad
+// al final (round-robin); por defecto se conserva el orden original de upstream.
+void thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue, PTR(OSThread) toadd, bool fifo_equals = false);
 PTR(OSThread) thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue);
 bool thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_);
 bool thread_queue_empty(RDRAM_ARG PTR(PTR(OSThread)) queue);
@@ -91,6 +105,9 @@ struct MessageQueueControl {
 void set_message_queue_control(const MessageQueueControl& mqc);
 void enqueue_external_message_src(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, EventMessageSource src);
 void enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked);
+// HH: entrega dirigida (usada para completaciones SP/DP): si `target` está bloqueado en `mq`,
+// se le despierta a él (no al primero de la lista). Ver ADR/arquitectura §5.
+void enqueue_external_message_to(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, PTR(OSThread) target);
 void wait_for_external_message(RDRAM_ARG1);
 void wait_for_external_message_timed(RDRAM_ARG1, u32 millis);
 

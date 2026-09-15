@@ -2,6 +2,7 @@
 #define __RSP_H__
 
 #include <cstdio>
+#include <cstdlib>
 
 #include "rsp_vu.hpp"
 #include "recomp.h"
@@ -97,7 +98,12 @@ static inline void RSP_MEM_H_STORE(uint32_t offset, uint32_t addr, uint32_t val)
 static inline void dma_rdram_to_dmem(uint8_t* rdram, uint32_t dmem_addr, uint32_t dram_addr, uint32_t rd_len) {
     rd_len += 1; // Read length is inclusive
     dram_addr &= 0xFFFFF8;
-    assert(dmem_addr + rd_len <= 0x1000);
+    // NDEBUG desactiva los asserts: un DMA fuera de DMEM corromperia globals. Chequeo real.
+    if (dmem_addr + rd_len > 0x1000) {
+        static int hh_n = 0;
+        if (hh_n++ < 20) fprintf(stderr, "[RSPDMA] OVERFLOW R dmem=%03X len=%X dram=%08X (clamp)\n", (unsigned)dmem_addr, (unsigned)rd_len, (unsigned)dram_addr);
+        rd_len = (dmem_addr < 0x1000) ? (0x1000 - dmem_addr) : 0;
+    }
     for (uint32_t i = 0; i < rd_len; i++) {
         RSP_MEM_B(i, dmem_addr) = MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000));
     }
@@ -106,7 +112,42 @@ static inline void dma_rdram_to_dmem(uint8_t* rdram, uint32_t dmem_addr, uint32_
 static inline void dma_dmem_to_rdram(uint8_t* rdram, uint32_t dmem_addr, uint32_t dram_addr, uint32_t wr_len) {
     wr_len += 1; // Write length is inclusive
     dram_addr &= 0xFFFFF8;
-    assert(dmem_addr + wr_len <= 0x1000);
+    if (dmem_addr + wr_len > 0x1000) {
+        static int hh_n = 0;
+        if (hh_n++ < 20) fprintf(stderr, "[RSPDMA] OVERFLOW W dmem=%03X len=%X (clamp)\n", (unsigned)dmem_addr, (unsigned)wr_len);
+        wr_len = (dmem_addr < 0x1000) ? (0x1000 - dmem_addr) : 0;
+    }
+    if (dram_addr + wr_len > 0x800000) {
+        static int hh_n = 0;
+        if (hh_n++ < 20) fprintf(stderr, "[RSPDMA] OVERFLOW W dram=%08X len=%X (clamp)\n", (unsigned)dram_addr, (unsigned)wr_len);
+        wr_len = (dram_addr < 0x800000) ? (0x800000 - dram_addr) : 0;
+    }
+    // HH diag: avisar si el ucode escribe fuera de su workspace de audio o sobre el objeto RSP.
+    {
+        uint32_t end = dram_addr + wr_len;
+        bool bad = false; (void)end;
+        // HH: las voces viven en descriptor+0x60..+0x67 y su buffer AI empieza en +0x70.
+        // Un DMA que pise descriptor+0x00..+0x6F corrompe el estado del driver de audio.
+        if (getenv("HH_CTXWATCH") != nullptr) {
+            struct { uint32_t lo, hi; const char* name; } voices[] = {
+                { 0xC79F0u, 0xC7A60u, "v1" },
+                { 0xC89E0u, 0xC8A50u, "v2" },
+                { 0xC99D0u, 0xC9A40u, "v3" },
+                { 0x1BBD60u, 0x1BBD80u, "bd6d" },
+            };
+            for (auto& v : voices) {
+                if (dram_addr < v.hi && end > v.lo) {
+                    static int hh_n = 0;
+                    if (hh_n++ < 80) fprintf(stderr, "[RSPW] PISA %s dram=%06X len=%X dmem=%03X\n",
+                        v.name, (unsigned)dram_addr, (unsigned)wr_len, (unsigned)dmem_addr);
+                }
+            }
+        }
+        if (bad) {
+            static int hh_n = 0;
+            if (hh_n++ < 40) fprintf(stderr, "[RSPW] sospechoso dram=%06X len=%X dmem=%03X\n", (unsigned)dram_addr, (unsigned)wr_len, (unsigned)dmem_addr);
+        }
+    }
     for (uint32_t i = 0; i < wr_len; i++) {
         MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000)) = RSP_MEM_B(i, dmem_addr);
     }

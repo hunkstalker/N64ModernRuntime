@@ -130,6 +130,7 @@ void timer_thread(RDRAM_ARG1) {
         }
         else {
             // Waiting for the timer completed, so send the timer's message to its message queue
+            HH_LOG("[TIM] fire t=%p interval=%lld mq=%p\n", (void*)cur_timer_, (long long)cur_timer->interval, (void*)cur_timer->mq);
             ultramodern::enqueue_external_message_src(cur_timer->mq, cur_timer->msg, false, ultramodern::EventMessageSource::Timer);
             // If the timer has a specified interval then reload it with that value
             if (cur_timer->interval != 0) {
@@ -191,6 +192,8 @@ extern "C" int osSetTimer(RDRAM_ARG PTR(OSTimer) t_, OSTime countdown, OSTime in
     t->interval = interval;
     t->mq = mq;
     t->msg = msg;
+
+    HH_LOG("[TIM] set t=%p countdown=%lld interval=%lld mq=%p\n", (void*)t_, (long long)countdown, (long long)interval, (void*)mq);
 
     timer_context.action_queue.enqueue(AddTimerAction{ t_ });
 

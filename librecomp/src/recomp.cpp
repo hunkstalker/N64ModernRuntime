@@ -56,14 +56,16 @@ std::mutex current_game_mutex;
 std::mutex mod_context_mutex{};
 
 // Simple file logger used by the boot path so progress is visible even without a console.
+// Opt-in via HH_BOOTLOG=<path>; when unset, boot logging is a no-op (no file is created).
 static FILE* g_boot_log = nullptr;
 static void boot_log(const char* fmt, ...) {
+    static const char* log_path = getenv("HH_BOOTLOG");
+    if (log_path == nullptr) {
+        return;
+    }
     if (g_boot_log == nullptr) {
-        std::error_code ec;
-        std::filesystem::path dir = std::filesystem::current_path();
-        std::filesystem::create_directories(dir, ec);
         // Truncate on first open so each run starts fresh.
-        g_boot_log = std::fopen((dir / "boot.log").string().c_str(), "w");
+        g_boot_log = std::fopen(log_path, "w");
     }
     if (g_boot_log == nullptr) {
         return;
@@ -451,7 +453,11 @@ recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_p
 }
 
 extern "C" void osGetMemSize_recomp(uint8_t * rdram, recomp_context * ctx) {
-    ctx->r2 = 8 * 1024 * 1024;
+    // Hybrid Heaven's boot checks osGetMemSize() against 0x400000 (4MB) and enters an
+    // infinite wait loop otherwise. The retail game targets the base 4MB machine (no
+    // Expansion Pak), so report 4MB even though the runtime allocates 8MB.
+    (void)rdram;
+    ctx->r2 = 4 * 1024 * 1024;
 }
 
 enum class StatusReg {
@@ -525,7 +531,8 @@ extern "C" void cop0_register_write(recomp_context* ctx, uint32_t reg, gpr value
 }
 
 extern "C" void switch_error(const char* func, uint32_t vram, uint32_t jtbl) {
-    printf("Switch-case out of bounds in %s at 0x%08X for jump table at 0x%08X\n", func, vram, jtbl);
+    fprintf(stderr, "Switch-case out of bounds in %s at 0x%08X for jump table at 0x%08X\n", func, vram, jtbl);
+    fflush(stderr);
     assert(false);
     exit(EXIT_FAILURE);
 }
@@ -534,14 +541,75 @@ extern "C" void do_break(uint32_t vram) {
     // TODO: properly handle break by restoring PC to caller and continuing.
     // For now, just warn and return to avoid killing the process.
     printf("do_break: unhandled break at original vram 0x%08X (ignored)\n", vram);
+    // HH: registrar en fichero (dedup) los break/stubs ejecutados: un simbolo mal acotado queda en
+    // stub do_break y rompe el flujo en silencio (asi se cuelga el NPC). hh_stub.log junto al exe.
+    {
+        static std::mutex stub_mutex;
+        static std::unordered_set<uint32_t> stub_seen;
+        std::lock_guard<std::mutex> lock(stub_mutex);
+        if (stub_seen.insert(vram).second) {
+            FILE* f = fopen("hh_stub.log", "a");
+            if (f != nullptr) {
+                fprintf(f, "[STUB] vram=0x%08X\n", vram);
+                fflush(f);
+                fclose(f);
+            }
+        }
+    }
 }
 
 std::string current_game_mode_id;
 std::optional<std::u8string> current_game = std::nullopt;
 std::atomic<GameStatus> game_status = GameStatus::None;
 
+// HH: contexto de registros MIPS del hilo de juego en ejecucion (para volcados de crash).
+static thread_local recomp_context* hh_current_ctx = nullptr;
+
+extern "C" recomp_context* hh_get_current_ctx() {
+    return hh_current_ctx;
+}
+
+// HH: sp (r29) del contexto del hilo actual, o 0 si no hay. Para diagnosticos sin exponer el tipo.
+extern "C" uint32_t hh_current_sp() {
+    return hh_current_ctx != nullptr ? (uint32_t)hh_current_ctx->r29 : 0;
+}
+
+// HH: registro de los contextos de todos los hilos de juego vivos. El watchdog de cuelgue del
+// port lo usa para volcar donde esta atascado cada hilo (RA/SP = punto de bloqueo).
+struct HhCtxSlot { std::atomic<recomp_context*> ctx{nullptr}; };
+static HhCtxSlot hh_ctx_slots[32];
+
+static void hh_register_ctx(recomp_context* ctx) {
+    for (auto& slot : hh_ctx_slots) {
+        recomp_context* expected = nullptr;
+        if (slot.ctx.compare_exchange_strong(expected, ctx)) {
+            return;
+        }
+    }
+}
+
+static void hh_unregister_ctx(recomp_context* ctx) {
+    for (auto& slot : hh_ctx_slots) {
+        recomp_context* expected = ctx;
+        if (slot.ctx.compare_exchange_strong(expected, nullptr)) {
+            return;
+        }
+    }
+}
+
+extern "C" int hh_get_thread_ctxs(recomp_context** out, int max) {
+    int n = 0;
+    for (auto& slot : hh_ctx_slots) {
+        recomp_context* c = slot.ctx.load();
+        if (c != nullptr && n < max) {
+            out[n++] = c;
+        }
+    }
+    return n;
+}
+
 void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t arg) {
-    fprintf(stderr, "[RT] thread addr=0x%llx sp=0x%llx arg=0x%llx rdram=%p\n",
+    HH_LOG("[RT] thread addr=0x%llx sp=0x%llx arg=0x%llx rdram=%p\n",
         (unsigned long long)addr, (unsigned long long)sp, (unsigned long long)arg, (void*)rdram);
     auto find_it = game_roms.find(current_game.value());
     const recomp::GameEntry& game_entry = find_it->second;
@@ -557,10 +625,167 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
     }
 
     recomp_func_t* func = get_function(addr);
+    hh_current_ctx = &ctx;
+    hh_register_ctx(&ctx);
     func(rdram, &ctx);
+    hh_unregister_ctx(&ctx);
+    hh_current_ctx = nullptr;
+}
+
+// HH: watchpoint de accesos de codigo recompilado (ver recomp.h). Config: HH_WATCH_ADDR=0x...
+// Loguea a hh_watch.log (acotado) la direccion accedida, el ra guest del contexto actual y la
+// direccion de retorno host (mapeable con el .map). Sirve para cazar quien pisa una direccion.
+extern "C" int hh_watch_active = 0;
+extern "C" unsigned int hh_watch_lo = 0;
+extern "C" unsigned int hh_watch_hi = 0;
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+static void* hh_watch_ret() { return _ReturnAddress(); }
+#else
+static void* hh_watch_ret() { return __builtin_return_address(0); }
+#endif
+
+// Base del modulo (para traducir direcciones host con el .map).
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+static uintptr_t hh_module_base() {
+    HMODULE hm = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&hh_watch_ret), &hm) && hm != nullptr) {
+        return reinterpret_cast<uintptr_t>(hm);
+    }
+    return 0;
+}
+#else
+#include <dlfcn.h>
+static uintptr_t hh_module_base() {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&hh_watch_ret), &info) != 0) {
+        return reinterpret_cast<uintptr_t>(info.dli_fbase);
+    }
+    return 0;
+}
+#endif
+
+static void hh_watch_init() {
+    const char* a = getenv("HH_WATCH_ADDR");
+    if (a == nullptr || *a == '\0') return;
+    unsigned long v = strtoul(a, nullptr, 0);
+    hh_watch_lo = (unsigned int)(v & 0x1FFFFFFFu);
+    hh_watch_hi = hh_watch_lo + 0x40;
+    hh_watch_active = 1;
+    fprintf(stderr, "[WATCH] vigilando RDRAM 0x%08X..0x%08X\n", hh_watch_lo, hh_watch_hi);
+}
+
+static void hh_watch_log(const char* what, uint64_t off, uint32_t extra) {
+    static FILE* f = nullptr;
+    static long n = 0;
+    static std::chrono::steady_clock::time_point t0{};
+    if (f == nullptr) {
+        f = fopen("hh_watch.log", "w");
+        if (f == nullptr) { hh_watch_active = 0; return; }
+        t0 = std::chrono::steady_clock::now();
+    }
+    if (n >= 60000) { hh_watch_active = 0; return; }
+    n++;
+    recomp_context* c = hh_get_current_ctx();
+    uint32_t ra = (c != nullptr) ? (uint32_t)c->r31 : 0;
+    uint32_t sp = (c != nullptr) ? (uint32_t)c->r29 : 0;
+    uint32_t a0 = (c != nullptr) ? (uint32_t)c->r4 : 0;
+    uint32_t a1 = (c != nullptr) ? (uint32_t)c->r5 : 0;
+    uint32_t a2 = (c != nullptr) ? (uint32_t)c->r6 : 0;
+    uint32_t a3 = (c != nullptr) ? (uint32_t)c->r7 : 0;
+    static uintptr_t hh_base = 0;
+    if (hh_base == 0) hh_base = hh_module_base();
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    void* ret = hh_watch_ret();
+    unsigned long long ret_off = (hh_base != 0) ? (unsigned long long)((uintptr_t)ret - hh_base) : 0;
+    fprintf(f, "[WATCH] t=%.3f %s off=%05llX ra=%08X sp=%08X a0=%08X a1=%08X a2=%08X a3=%08X extra=%08X ret=%p (exe+0x%llX)\n",
+            t, what, (unsigned long long)off, ra, sp, a0, a1, a2, a3, extra, ret, ret_off);
+#if defined(_WIN32)
+    {
+        void* frames[16];
+        USHORT nf = CaptureStackBackTrace(0, 16, frames, nullptr);
+        unsigned long long offs[16];
+        for (USHORT i = 0; i < nf && i < 16; i++) {
+            offs[i] = (hh_base != 0) ? (unsigned long long)((uintptr_t)frames[i] - hh_base) : 0;
+        }
+        fprintf(f, "         bt:");
+        for (USHORT i = 0; i < nf && i < 16; i++) fprintf(f, " 0x%llX", offs[i]);
+        fprintf(f, "\n");
+    }
+#endif
+    fflush(f);
+}
+
+// HH: ring buffer de las ultimas llamadas (target + sp) para volcar la secuencia que hunde la pila.
+struct HhCallRec { uint32_t target; uint32_t sp; };
+static thread_local HhCallRec hh_ring[96];
+static thread_local int hh_ring_n = 0;
+extern "C" void hh_ring_record(uint32_t target, uint32_t sp) {
+    hh_ring[hh_ring_n % 96] = { target, sp };
+    hh_ring_n++;
+}
+extern "C" void hh_ring_dump(FILE* f) {
+    int start = hh_ring_n > 96 ? hh_ring_n - 96 : 0;
+    for (int i = start; i < hh_ring_n; i++) {
+        const HhCallRec& r = hh_ring[i % 96];
+        fprintf(f, "   call -> 0x%08X sp=%08X\n", r.target, r.sp);
+    }
+}
+
+// HH: ring grande (por hilo) de llamadas para capturar un frame entero y localizar la fuga de pila.
+static const int HH_RING2_SIZE = 1 << 16;
+static thread_local HhCallRec hh_ring2[HH_RING2_SIZE];
+static thread_local int hh_ring2_n = 0;
+extern "C" void hh_ring2_record(uint32_t target, uint32_t sp) {
+    hh_ring2[hh_ring2_n % HH_RING2_SIZE] = { target, sp };
+    hh_ring2_n++;
+}
+extern "C" int hh_ring2_count() { return hh_ring2_n; }extern "C" void hh_ring2_dump_last(FILE* f, int count) {
+    if (count > hh_ring2_n) count = hh_ring2_n;
+    if (count > HH_RING2_SIZE) count = HH_RING2_SIZE;
+    int start = hh_ring2_n - count;
+    for (int i = start; i < hh_ring2_n; i++) {
+        const HhCallRec& r = hh_ring2[i % HH_RING2_SIZE];
+        fprintf(f, "0x%08X %08X\n", r.target, r.sp);
+    }
+}
+
+extern "C" void hh_watch_hit(uint64_t off) {
+    // HH: la primera vez que la pila entra en la zona del struct, volcar las ultimas llamadas.
+    recomp_context* c = hh_get_current_ctx();
+    static bool dumped = false;
+    if (!dumped && c != nullptr && (uint32_t)c->r29 != 0 && (uint32_t)c->r29 < 0x8005A000u) {
+        dumped = true;
+        FILE* f = fopen("hh_ring.log", "w");
+        if (f != nullptr) {
+            fprintf(f, "=== HH ring de llamadas (sp=%08X, off=%05llX) ===\n",
+                    (uint32_t)c->r29, (unsigned long long)off);
+            hh_ring_dump(f);
+            fflush(f);
+            fclose(f);
+        }
+    }
+    hh_watch_log("mem", off, 0);
+}
+
+extern "C" void hh_watch_dma(uint32_t dram, uint32_t size) {
+    if (hh_watch_active == 0) return;
+    uint32_t lo = dram & 0x1FFFFFFFu;
+    uint32_t hi = lo + size;
+    if (hi > hh_watch_lo && lo < hh_watch_hi) {
+        hh_watch_log("dma", lo, size);
+    }
 }
 
 void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
+    hh_watch_init();
     // Initialize the overlays
     recomp::overlays::init_overlays();
     init_mmio(rdram);
@@ -600,7 +825,7 @@ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
     MEM_W(osTvType, 0) = 1; // NTSC
     MEM_W(osRomBase, 0) = 0xB0000000u; // standard rom base
     MEM_W(osResetType, 0) = 0; // cold reset
-    MEM_W(osMemSize, 0) = 8 * 1024 * 1024; // 8MB
+    MEM_W(osMemSize, 0) = 4 * 1024 * 1024; // 4MB (base retail machine; see osGetMemSize_recomp)
 }
 
 std::u8string recomp::current_game_id() {
@@ -778,6 +1003,9 @@ void recomp::mods::set_mod_index(const std::string &mod_game_id, const std::stri
     return mod_context->set_mod_index(mod_game_id, mod_id, index);
 }
 
+// HH: volcado de crash del port (definido en src/main/main.cpp).
+extern "C" void hh_port_crash_dump(uint32_t n64_addr);
+
 // Runs the game entrypoint, capturing a Windows access violation so the boot's faulting address
 // can be reported. Extracted into its own noinline function because __try/__except cannot be used
 // in a function that requires C++ object unwinding.
@@ -871,6 +1099,8 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                     // Convert the host pointer back to the N64 address the recompiled code was accessing.
                     int64_t n64_addr = (int64_t)(intptr_t)(crash_addr - (uintptr_t)rdram) + 0xFFFFFFFF80000000LL;
                     boot_log("Crash N64 addr = 0x%08X\n", (uint32_t)n64_addr);
+                    // HH: que el port deje su volcado completo (hh_crash.log + RDRAM + DMEM).
+                    hh_port_crash_dump((uint32_t)n64_addr);
                     std::exit(EXIT_FAILURE);
                 }
                 boot_log("Entrypoint returned\n");
@@ -880,7 +1110,11 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                     // spawns (via osStartThread from a NULL thread_self) cannot run concurrently with
                     // it; they block on the lock until the entrypoint returns and releases it.
                     ultramodern::acquire_game_lock();
+                    hh_current_ctx = context;
+                    hh_register_ctx(context);
                     game_entry.entrypoint(rdram, context);
+                    hh_unregister_ctx(context);
+                    hh_current_ctx = nullptr;
                     ultramodern::release_game_lock();
                     boot_log("Entrypoint returned\n");
                 } catch (ultramodern::thread_terminated& terminated) {

@@ -39,7 +39,18 @@ typedef uint8_t u8;
 #  define RDRAM_ARG1 uint8_t *rdram
 #  define PASS_RDRAM rdram, 
 #  define PASS_RDRAM1 rdram
-#  define TO_PTR(type, var) ((type*)(&rdram[(uint64_t)var - 0xFFFFFFFF80000000]))
+// HH: conversión guest→host segura. Igual que la fórmula original para direcciones mapeadas
+// (KSEG0/KSEG1: RDRAM y ventana MMIO), pero los accesos no mapeados (p.ej. osSendMesg con cola
+// NULL, que el hardware/emulador ignoran) van a un scratch fuera del heap del runtime en vez de
+// calcular un puntero fuera del buffer (SEGV). Ver notes/2026-09-14-fix-*.md.
+static inline uint64_t hh_to_ptr_off(uint32_t guest) {
+    if (guest >= 0x80000000u) {
+        uint32_t off = guest - 0x80000000u;
+        return (off < 0x40000000u) ? (uint64_t)off : UINT64_C(0x0FFFFF0);
+    }
+    return (guest < 0x00800000u) ? (uint64_t)guest : UINT64_C(0x0FFFFF0);
+}
+#  define TO_PTR(type, var) ((type*)(&rdram[hh_to_ptr_off((uint32_t)(var))]))
 #  define GET_MEMBER(type, addr, member) (addr + (intptr_t)&(((type*)nullptr)->member))
 #  ifdef __cplusplus
 #    define NULLPTR (PTR(void))0
@@ -106,6 +117,26 @@ typedef struct OSThread_t {
     UltraThreadContext* context; // An actual pointer regardless of platform
     int32_t sp;
 } OSThread;
+
+// HH: sombra host de los campos de scheduling del OSThread (ver threads.cpp). El scheduler debe
+// usar SIEMPRE estos accesores: el struct guest puede quedar pisado (pila del propio hilo, reuso).
+#ifdef __cplusplus
+extern "C" {
+#endif
+void hh_sh_init(OSThread* t, int32_t next, int32_t priority, int32_t queue, uint16_t state, int32_t id, int32_t sp);
+int32_t hh_sh_get_next(OSThread* t);
+void hh_sh_set_next(OSThread* t, int32_t v);
+int32_t hh_sh_get_priority(OSThread* t);
+void hh_sh_set_priority(OSThread* t, int32_t v);
+int32_t hh_sh_get_queue(OSThread* t);
+void hh_sh_set_queue(OSThread* t, int32_t v);
+int32_t hh_sh_get_state(OSThread* t);
+void hh_sh_set_state(OSThread* t, int32_t v);
+int32_t hh_sh_get_id(OSThread* t);
+int32_t hh_sh_get_sp(OSThread* t);
+#ifdef __cplusplus
+}
+#endif
 
 typedef u32 OSEvent;
 typedef PTR(void) OSMesg;
@@ -261,7 +292,7 @@ typedef struct {
 extern "C" {
 #endif // __cplusplus
 
-void osInitialize(void);
+void osInitialize_stub(void);
 
 typedef void (thread_func_t)(PTR(void));
 
@@ -279,16 +310,12 @@ s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue), OSMesg, s32);
 s32 osJamMesg(RDRAM_ARG PTR(OSMesgQueue), OSMesg, s32);
 s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue), PTR(OSMesg), s32);
 void osSetEventMesg(RDRAM_ARG OSEvent, PTR(OSMesgQueue), OSMesg);
-void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue), OSMesg, u32);
-void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr);
-void osViSetMode(RDRAM_ARG PTR(OSViMode));
-void osViSetSpecialFeatures(uint32_t func);
-void osViBlack(uint8_t active);
+// ADR 0003: osCreateViManager/osViSetMode/osViSetEvent/osViSwapBuffer/osViBlack/
+// osViSetSpecialFeatures/osViGetCurrent(Next)Framebuffer se generan del ROM; sus prototipos viven
+// en RecompiledFuncs/funcs.h (firma recomp). Aquí solo quedan los que el runtime reimplementa.
 void osViRepeatLine(uint8_t active);
 void osViSetXScale(float scale);
 void osViSetYScale(float scale);
-PTR(void) osViGetNextFramebuffer();
-PTR(void) osViGetCurrentFramebuffer();
 u32 osGetCount();
 void osSetCount(u32 count);
 OSTime osGetTime();

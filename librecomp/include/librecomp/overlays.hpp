@@ -46,6 +46,19 @@ namespace recomp {
         void add_loaded_function(int32_t ram_addr, recomp_func_t* func);
         void register_flat_code();
 
+        // HH: módulos de código con base reutilizada. El juego pide la carga al loader
+        // (`FUN_80003824`) con el offset de ROM retail del blob (a0); el runtime registra la
+        // sección recompilada correspondiente en la base de RAM que pide el juego (a1). Así un
+        // módulo puede reemplazar a otro en la misma VRAM (p.ej. idx 24 sobre la base de idx 23).
+        // OJO: `init_overlays` ordena las secciones por `rom_addr`, así que el registro busca por
+        // el offset del ROM combinado, no por índice fijo.
+        struct ModuleSource {
+            uint32_t src_rom;   // offset del blob en la ROM retail (a0 del loader)
+            uint32_t rom_addr;  // offset de la sección en el ROM combinado (clave de sección)
+        };
+        void register_module_sources(const ModuleSource* sources, size_t count);
+        void load_module_by_source(uint32_t src_rom, int32_t ram_addr);
+
         struct BasePatchedFunction {
             size_t patch_section;
             size_t function_index;

@@ -1,5 +1,8 @@
 #include "ultramodern/ultramodern.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "helpers.hpp"
 
 #define MAXCONTROLLERS 4
@@ -49,13 +52,22 @@ extern "C" void osContGetReadData_recomp(uint8_t* rdram, recomp_context* ctx) {
 
     osContGetReadData(dummy_data);
 
-    for (int controller = 0; controller < MAXCONTROLLERS; controller++) {
-        if (dummy_data[controller].err_no == 0) {
-            MEM_H(6 * controller + 0, data) = dummy_data[controller].button;
-            MEM_B(6 * controller + 2, data) = dummy_data[controller].stick_x;
-            MEM_B(6 * controller + 3, data) = dummy_data[controller].stick_y;
-            MEM_B(6 * controller + 4, data) = dummy_data[controller].err_no;
+    if (std::getenv("HH_INLOG") != nullptr) {
+        static uint16_t pad_last = 0;
+        if (dummy_data[0].button != pad_last) {
+            std::fprintf(stderr, "[PAD] c0 button=0x%04X err=%u\n", dummy_data[0].button, (unsigned)dummy_data[0].err_no);
+            pad_last = dummy_data[0].button;
         }
+    }
+
+    for (int controller = 0; controller < MAXCONTROLLERS; controller++) {
+        // libultra writes an OSContPad for every controller, including absent ones (with
+        // err_no = CONT_NO_RESPONSE_ERROR). Skipping absent controllers leaves stale values
+        // in the game's buffer, which game logic can misread as "controller connected".
+        MEM_H(6 * controller + 0, data) = dummy_data[controller].button;
+        MEM_B(6 * controller + 2, data) = dummy_data[controller].stick_x;
+        MEM_B(6 * controller + 3, data) = dummy_data[controller].stick_y;
+        MEM_B(6 * controller + 4, data) = dummy_data[controller].err_no;
     }
 }
 

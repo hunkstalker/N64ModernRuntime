@@ -94,10 +94,27 @@ static void __osContGetInitData(u8* pattern, OSContStatus *data) {
     }
 }
 
+extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 flags);
+
 extern "C" s32 osContInit(RDRAM_ARG PTR(OSMesgQueue) mq, u8* bitpattern, PTR(OSContStatus) data_) {
     OSContStatus *data = TO_PTR(OSContStatus, data_);
 
+    // libultra's osContInit is a one-shot initializer: subsequent calls do nothing.
+    static bool cont_initialized = false;
+    if (cont_initialized) {
+        return 0;
+    }
+    cont_initialized = true;
+
     max_controllers = MAXCONTROLLERS;
+
+    // Issue the SI status query and wait for its completion message on `mq`, mirroring libultra.
+    // The runtime fills the controller data synchronously, but the game expects osContInit to wait
+    // on the SI event queue (and the wait yields the thread, which the boot ordering depends on).
+    ultramodern::send_si_message();
+    if (mq != NULLPTR) {
+        osRecvMesg(PASS_RDRAM mq, NULLPTR, OS_MESG_BLOCK);
+    }
 
     __osContGetInitData(bitpattern, data);
 

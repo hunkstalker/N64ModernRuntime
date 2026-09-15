@@ -4,11 +4,11 @@
 #include "recomp.h"
 
 extern "C" void osInitialize_recomp(uint8_t * rdram, recomp_context * ctx) {
-    osInitialize();
+    osInitialize_stub();
 }
 
 extern "C" void __osInitialize_common_recomp(uint8_t * rdram, recomp_context * ctx) {
-    osInitialize();
+    osInitialize_stub();
 }
 
 extern "C" void osCreateThread_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -49,11 +49,21 @@ extern "C" void osCreateMesgQueue_recomp(uint8_t* rdram, recomp_context* ctx) {
     osCreateMesgQueue(rdram, (int32_t)ctx->r4, (int32_t)ctx->r5, (s32)ctx->r6);
 }
 
+static void hh_check_mq_arg(const char* fn, uint8_t* rdram, recomp_context* ctx) {
+    uint32_t mq = (uint32_t)ctx->r4;
+    if (mq != 0 && (mq < 0x80000000u || mq >= 0x80800000u || (mq & 3u))) {
+        static int hh_n = 0;
+        if (hh_n++ < 40) fprintf(stderr, "[BADMQ] %s mq=%08X ra=%08X\n", fn, mq, (unsigned)ctx->r31);
+    }
+}
+
 extern "C" void osRecvMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
+    hh_check_mq_arg("osRecvMesg", rdram, ctx);
     ctx->r2 = osRecvMesg(rdram, (int32_t)ctx->r4, (int32_t)ctx->r5, (s32)ctx->r6);
 }
 
 extern "C" void osSendMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
+    hh_check_mq_arg("osSendMesg", rdram, ctx);
     ctx->r2 = osSendMesg(rdram, (int32_t)ctx->r4, (OSMesg)ctx->r5, (s32)ctx->r6);
 }
 
@@ -63,10 +73,6 @@ extern "C" void osJamMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
 
 extern "C" void osSetEventMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
     osSetEventMesg(rdram, (OSEvent)ctx->r4, (int32_t)ctx->r5, (OSMesg)ctx->r6);
-}
-
-extern "C" void osViSetEvent_recomp(uint8_t * rdram, recomp_context * ctx) {
-    osViSetEvent(rdram, (int32_t)ctx->r4, (OSMesg)ctx->r5, (u32)ctx->r6);
 }
 
 extern "C" void osGetCount_recomp(uint8_t * rdram, recomp_context * ctx) {
