@@ -97,8 +97,9 @@ static void hh_mqa_log(RDRAM_ARG const char* what, PTR(OSMesgQueue) mq_, OSMesg 
         tid = (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread()));
     }
     OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
-    total += fprintf(f, "[MQA] t=%.3f %s tid=%d mq=%08X msg=%08X valid=%d recvHead=%08X sendHead=%08X extra=%d\n",
-                     t, what, tid, (unsigned)mq_, (unsigned)msg, (int)mq->validCount,
+    unsigned thr = ultramodern::is_game_thread() ? (unsigned)ultramodern::this_thread() : 0;
+    total += fprintf(f, "[MQA] t=%.3f %s tid=%d thr=%08X mq=%08X msg=%08X valid=%d recvHead=%08X sendHead=%08X extra=%d\n",
+                     t, what, tid, thr, (unsigned)mq_, (unsigned)msg, (int)mq->validCount,
                      (unsigned)mq->blocked_on_recv, (unsigned)mq->blocked_on_send, extra);
     fflush(f);
 }
@@ -164,6 +165,7 @@ void dequeue_external_messages(RDRAM_ARG1) {
                     v, (unsigned)to_send.mesg, (int)to_send.jam, (int)to_send.requeue_if_blocked, (unsigned)to_send.target);
             }
         }
+        hh_mqa_log(PASS_RDRAM "drain", to_send.mq, to_send.mesg, 0);
         if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false, to_send.target)) {
             if (to_send.requeue_if_blocked) {
                 requeued_messages.push_back(to_send);
