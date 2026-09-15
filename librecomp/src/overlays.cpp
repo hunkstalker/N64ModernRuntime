@@ -850,9 +850,11 @@ extern "C" int hh_watch_active;
 extern "C" recomp_context* hh_get_current_ctx(void);
 extern "C" void hh_ring_record(uint32_t target, uint32_t sp);
 extern "C" void hh_ring2_record(uint32_t target, uint32_t sp);
+extern "C" void hh_callring_record(uint32_t addr);
 
 extern "C" recomp_func_t * get_function(int32_t addr) {
     hh_calltrace((uint32_t)addr);
+    hh_callring_record((uint32_t)addr);
     // HH: registrar (target, sp) de cada llamada para diagnosticar hundimientos de pila.
     if (hh_watch_active) {
         recomp_context* hh_c = hh_get_current_ctx();

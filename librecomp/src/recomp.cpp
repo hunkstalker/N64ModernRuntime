@@ -21,6 +21,7 @@
 
 #include "recomp.h"
 #include "librecomp/overlays.hpp"
+#include "ultramodern/ultra64.h"
 #include "librecomp/game.hpp"
 #include "xxHash/xxh3.h"
 
@@ -576,13 +577,49 @@ extern "C" uint32_t hh_current_sp() {
 
 // HH: registro de los contextos de todos los hilos de juego vivos. El watchdog de cuelgue del
 // port lo usa para volcar donde esta atascado cada hilo (RA/SP = punto de bloqueo).
-struct HhCtxSlot { std::atomic<recomp_context*> ctx{nullptr}; };
+// HH: anillo de las ultimas llamadas guest por hilo (para el watchdog: localizar bucles que no
+// ceden). En este port todas las llamadas pasan por get_function (use_lookup_for_all_function_calls).
+struct HhCallRing {
+    std::atomic<uint32_t> entries[16];
+    std::atomic<uint32_t> n{0};
+};
+struct HhCtxSlot {
+    std::atomic<recomp_context*> ctx{nullptr};
+    std::atomic<int> tid{-1};
+    std::atomic<uintptr_t> thr{0};
+    HhCallRing ring;
+};
 static HhCtxSlot hh_ctx_slots[32];
+static thread_local HhCallRing* hh_my_ring = nullptr;
 
-static void hh_register_ctx(recomp_context* ctx) {
+extern "C" void hh_callring_record(uint32_t addr) {
+    if (hh_my_ring == nullptr) return;
+    uint32_t n = hh_my_ring->n.load(std::memory_order_relaxed);
+    hh_my_ring->entries[n & 15].store(addr, std::memory_order_relaxed);
+    hh_my_ring->n.store(n + 1, std::memory_order_relaxed);
+}
+
+extern "C" int hh_get_callring(recomp_context* c, uint32_t* out, int max) {
+    for (auto& slot : hh_ctx_slots) {
+        if (slot.ctx.load() == c) {
+            uint32_t n = slot.ring.n.load();
+            int cnt = (int)std::min<uint32_t>(n, 16);
+            for (int i = 0; i < cnt && i < max; i++) {
+                out[i] = slot.ring.entries[(n - cnt + i) & 15].load();
+            }
+            return cnt;
+        }
+    }
+    return 0;
+}
+
+static void hh_register_ctx(recomp_context* ctx, int tid, uintptr_t thr) {
     for (auto& slot : hh_ctx_slots) {
         recomp_context* expected = nullptr;
         if (slot.ctx.compare_exchange_strong(expected, ctx)) {
+            slot.tid.store(tid);
+            slot.thr.store(thr);
+            hh_my_ring = &slot.ring;
             return;
         }
     }
@@ -592,6 +629,9 @@ static void hh_unregister_ctx(recomp_context* ctx) {
     for (auto& slot : hh_ctx_slots) {
         recomp_context* expected = ctx;
         if (slot.ctx.compare_exchange_strong(expected, nullptr)) {
+            slot.tid.store(-1);
+            slot.thr.store(0);
+            if (hh_my_ring == &slot.ring) hh_my_ring = nullptr;
             return;
         }
     }
@@ -603,6 +643,34 @@ extern "C" int hh_get_thread_ctxs(recomp_context** out, int max) {
         recomp_context* c = slot.ctx.load();
         if (c != nullptr && n < max) {
             out[n++] = c;
+        }
+    }
+    return n;
+}
+
+// HH: como hh_get_thread_ctxs pero devuelve tambien el id y el puntero de OSThread (watchdog).
+extern "C" int hh_get_thread_ctxs_tids(recomp_context** out, int* tids, int max) {
+    int n = 0;
+    for (auto& slot : hh_ctx_slots) {
+        recomp_context* c = slot.ctx.load();
+        if (c != nullptr && n < max) {
+            out[n] = c;
+            tids[n] = slot.tid.load();
+            n++;
+        }
+    }
+    return n;
+}
+
+extern "C" int hh_get_thread_ctxs_full(recomp_context** out, int* tids, uintptr_t* thrs, int max) {
+    int n = 0;
+    for (auto& slot : hh_ctx_slots) {
+        recomp_context* c = slot.ctx.load();
+        if (c != nullptr && n < max) {
+            out[n] = c;
+            tids[n] = slot.tid.load();
+            thrs[n] = slot.thr.load();
+            n++;
         }
     }
     return n;
@@ -626,7 +694,7 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
 
     recomp_func_t* func = get_function(addr);
     hh_current_ctx = &ctx;
-    hh_register_ctx(&ctx);
+    hh_register_ctx(&ctx, (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread())), (uintptr_t)TO_PTR(OSThread, ultramodern::this_thread()));
     func(rdram, &ctx);
     hh_unregister_ctx(&ctx);
     hh_current_ctx = nullptr;
@@ -1111,7 +1179,7 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                     // it; they block on the lock until the entrypoint returns and releases it.
                     ultramodern::acquire_game_lock();
                     hh_current_ctx = context;
-                    hh_register_ctx(context);
+                    hh_register_ctx(context, (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread())), (uintptr_t)TO_PTR(OSThread, ultramodern::this_thread()));
                     game_entry.entrypoint(rdram, context);
                     hh_unregister_ctx(context);
                     hh_current_ctx = nullptr;

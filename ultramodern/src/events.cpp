@@ -155,9 +155,32 @@ ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
     return &events_context.vi.update_screen_regs;
 }
 
+
+// HH: traza de eventos (osSetEventMesg y entregas VI/AI) en fichero PROPIO (hh_evt.log) para que no
+// lo trunque el logger de colas. Sirve para cazar el cuelgue por dano (el hilo VI deja de entregar).
+extern uint64_t total_vis;
+
+extern "C" void hh_evt_log(const char* what, int event_id, PTR(OSMesgQueue) mq_, OSMesg msg, unsigned long long vi, int tid) {
+    if (getenv("HH_MQLOG_ALL") == nullptr) return;
+    static FILE* f = nullptr;
+    static long total = 0;
+    if (f == nullptr) {
+        f = fopen("hh_evt.log", "w");
+        if (f == nullptr) return;
+    }
+    if (total > (4L * 1024 * 1024)) return;
+    total += fprintf(f, "[EVT] t_vis=%llu %s tid=%d event=%d mq=%08X msg=%08X\n",
+                     vi, what, tid, event_id, (unsigned)mq_, (unsigned)msg);
+    fflush(f);
+}
+
 extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_, OSMesg msg) {
-    std::lock_guard lock{ events_context.message_mutex };
+    hh_evt_log("set-enter", (int)event_id, mq_, msg, (unsigned long long)total_vis,
+               ultramodern::is_game_thread() ? (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread())) : -1);
     HH_LOG("[EV] osSetEventMesg event=%d mq=%p msg=%p\n", (int)event_id, (void*)mq_, (void*)msg);
+    std::unique_lock<std::mutex> lock{ events_context.message_mutex };
+    hh_evt_log("set-acquired", (int)event_id, mq_, msg, (unsigned long long)total_vis,
+               ultramodern::is_game_thread() ? (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread())) : -1);
 
     switch (event_id) {
         case OS_EVENT_SP:
@@ -181,6 +204,10 @@ extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_,
             events_context.vi_event.mq = mq_;
             break;
     }
+
+    lock.unlock();
+    hh_evt_log("set-exit", (int)event_id, mq_, msg, (unsigned long long)total_vis,
+               ultramodern::is_game_thread() ? (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread())) : -1);
 
     // Mirror the ROM libultra bookkeeping: __osEventStateTab[event_id] = { mq, msg }.
     // The game reads this table directly at 0x800CD5F0 + event_id * 8; the runtime replaces
@@ -297,12 +324,14 @@ void vi_thread_func() {
         // If the game has started, handle sending VI and AI events.
         if (ultramodern::is_game_started()) {
             {
+                hh_evt_log("vi-deliver-try", -1, NULLPTR, 0, (unsigned long long)total_vis, -1);
                 std::lock_guard lock{ events_context.message_mutex };
                 // Interrupt VI de hardware: lo consume viMgrMain (osCreateViManager lo registró
                 // con osSetEventMesg(OS_EVENT_VI)). La entrega al juego la hace el ROM.
                 if (events_context.vi_event.mq != NULLPTR) {
                     ultramodern::enqueue_external_message_src(events_context.vi_event.mq, events_context.vi_event.msg, false, ultramodern::EventMessageSource::Vi);
                 }
+                hh_evt_log("vi-deliver-ok", -1, events_context.vi_event.mq, (OSMesg)events_context.vi_event.msg, (unsigned long long)total_vis, -1);
                 // HH diag: vigilancia de los contextos de audio (voice+0x60/+0x64/+0x5C) y de la
                 // tabla de voces (0x80091BE0..) para localizar la corrupcion del descriptor.
                 if (getenv("HH_CTXWATCH") != nullptr) {

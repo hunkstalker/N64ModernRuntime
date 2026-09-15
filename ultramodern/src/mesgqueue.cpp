@@ -76,6 +76,33 @@ static void hh_check_mq(const char* where, PTR(OSMesgQueue) mq) {
     }
 }
 
+
+// HH: traza generica de colas de mensajes (HH_MQLOG_ALL=1) -> hh_mq_all.log.
+// Objetivo: ver quien envia/recibe en cada cola (tid guest, mq, msg) durante un cuelgue.
+static void hh_mqa_log(RDRAM_ARG const char* what, PTR(OSMesgQueue) mq_, OSMesg msg, int extra) {
+    static const bool on = getenv("HH_MQLOG_ALL") != nullptr;
+    if (!on) return;
+    static FILE* f = nullptr;
+    static long total = 0;
+    static std::chrono::steady_clock::time_point t0{};
+    if (f == nullptr) {
+        f = fopen("hh_mq_all.log", "w");
+        if (f == nullptr) return;
+        t0 = std::chrono::steady_clock::now();
+    }
+    if (total > (128L * 1024 * 1024)) return;
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    int tid = -1;
+    if (ultramodern::is_game_thread()) {
+        tid = (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread()));
+    }
+    OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
+    total += fprintf(f, "[MQA] t=%.3f %s tid=%d mq=%08X msg=%08X valid=%d recvHead=%08X sendHead=%08X extra=%d\n",
+                     t, what, tid, (unsigned)mq_, (unsigned)msg, (int)mq->validCount,
+                     (unsigned)mq->blocked_on_recv, (unsigned)mq->blocked_on_send, extra);
+    fflush(f);
+}
+
 // HH: traza quirurgica de la cola del helper sincrono de lectura ROM (0x8005C268, mb en 0x8005CD80):
 // quien pide, quien entrega, si se duerme y si alguien lo despierta. Sirve para cazar la
 // completacion perdida del cuelgue del NPC. Fichero hh_mq.log junto al exe (topes de tamano).
@@ -253,6 +280,7 @@ static bool remove_blocked_thread(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThr
 
 bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block, PTR(OSThread) target) {
     hh_gatelog(PASS_RDRAM "send", mq_, msg);
+    hh_mqa_log(PASS_RDRAM "send", mq_, msg, jam ? 1 : 0);
     hh_mqlog(PASS_RDRAM "send-in", mq_, ultramodern::is_game_thread() ? ultramodern::this_thread() : NULLPTR, jam ? 1 : 0);
     OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
     if (getenv("HH_QLOG") != nullptr) {
@@ -320,6 +348,7 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block, P
 bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
     OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
     hh_mqlog(PASS_RDRAM "recv-in", mq_, NULLPTR, block ? 1 : 0);
+    if (block) hh_mqa_log(PASS_RDRAM "recv-block", mq_, 0, 0);
     // HH: completación dirigida pendiente para este hilo (la entrega el do_send dirigido).
     if (take_pending_completion(PASS_RDRAM ultramodern::this_thread(), mq_, msg_)) {
         hh_mqlog(PASS_RDRAM "recv-pend", mq_, NULLPTR, 0);
@@ -398,6 +427,7 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
     }
     hh_gatelog(PASS_RDRAM "recv", mq_, TO_PTR(OSMesg, mq->msg)[mq->first]);
     hh_mqlog(PASS_RDRAM "recv-ok", mq_, NULLPTR, 0);
+    hh_mqa_log(PASS_RDRAM "recv-ok", mq_, TO_PTR(OSMesg, mq->msg)[mq->first], 0);
     // HH: sp del receptor + mensaje al consumir de la cola de comandos del hilo principal.
     if ((uint32_t)mq_ == 0x8005C288u) {
         static FILE* cf = nullptr;

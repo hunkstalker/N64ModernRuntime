@@ -126,6 +126,18 @@ extern "C" void    hh_sh_set_state(OSThread* t, int32_t v)   { if (HhThreadShado
 extern "C" int32_t hh_sh_get_id(OSThread* t)      { HhThreadShadow* s = hh_sh_find(t); return s ? s->id : -1; }
 extern "C" int32_t hh_sh_get_sp(OSThread* t)      { HhThreadShadow* s = hh_sh_find(t); return s ? s->sp : 0; }
 
+// HH: info de un hilo por puntero de OSThread (para el watchdog; id/estado/cola/sp de la sombra).
+extern "C" int hh_thread_info(uintptr_t t, uint32_t* out) {
+    OSThread* th = (OSThread*)t;
+    HhThreadShadow* s = hh_sh_find(th);
+    if (s == nullptr) return 0;
+    out[0] = (uint32_t)s->id;
+    out[1] = (uint32_t)s->state;
+    out[2] = (uint32_t)s->queue;
+    out[3] = (uint32_t)s->sp;
+    return 1;
+}
+
 // The N64 is a single-CPU machine: only one game thread may ever be executing at a time.
 // The cooperative scheduler handles yields, but osStartThread from the boot thread
 // (thread_self == NULL) signals a thread without parking the boot thread, so both can run
