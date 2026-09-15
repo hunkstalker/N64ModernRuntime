@@ -861,7 +861,8 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
     // HH: vigilancia del dispatch del bucle principal (livelock del dano): registra, en cada
     // llamada al frame (0x80001454) o al no-op (0x80001BB0), el registro s0 (r16) y el valor de
     // memoria que consulta el branch (lhu 0x0(s0)). Gated por HH_MQLOG_ALL.
-    if (((uint32_t)addr == 0x80001454u || (uint32_t)addr == 0x80001BB0u) && getenv("HH_MQLOG_ALL") != nullptr) {
+    if (((uint32_t)addr == 0x80001454u || (uint32_t)addr == 0x80001BB0u ||
+         (uint32_t)addr == 0x8000290Cu || (uint32_t)addr == 0x800266B0u) && getenv("HH_MQLOG_ALL") != nullptr) {
         recomp_context* hc = hh_get_current_ctx();
         uint32_t s0 = hc != nullptr ? (uint32_t)hc->r16 : 0;
         uint32_t flag = 0;
