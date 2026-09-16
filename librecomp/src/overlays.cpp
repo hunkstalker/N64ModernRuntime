@@ -2,12 +2,26 @@
 #include <cassert>
 #include <chrono>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+extern "C" char __ImageBase;  // base real de carga del .exe (ASLR incluida)
+#define HH_RETURN_ADDR() _ReturnAddress()
+#define HH_RETURN_RVA() ((uint64_t)((uintptr_t)_ReturnAddress() - (uintptr_t)&__ImageBase))
+#elif defined(__GNUC__) || defined(__clang__)
+#define HH_RETURN_ADDR() __builtin_return_address(0)
+#define HH_RETURN_RVA() ((uint64_t)(uintptr_t)__builtin_return_address(0))
+#else
+#define HH_RETURN_ADDR() (nullptr)
+#define HH_RETURN_RVA() (UINT64_C(0))
+#endif
 
 #include "ultramodern/ultramodern.hpp"
 
@@ -956,13 +970,71 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
     }
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {
-        fprintf(stderr, "Failed to find function at 0x%08X\n", addr);
+        // HH: diagnostico del LLAMANTE. Un target invalido (p. ej. 0xFF7F84CD) suele ser un puntero
+        // de funcion corrupto, no un simbolo sin registrar. `ra` identifica al que intenta llamarlo.
+        recomp_context* hc_miss = hh_get_current_ctx();
+        char caller[320];
+        if (hc_miss != nullptr) {
+            // `host_ret` = direccion de retorno NATIVA dentro de la funcion recompilada llamante;
+            // se simboliza con el .map (exe+0x...) y da la funcion guest exacta (p. ej. M12_FUN_...).
+            snprintf(caller, sizeof(caller),
+                     "  caller ra=%08X sp=%08X r4=%08X r5=%08X r6=%08X r7=%08X host_ret=exe+0x%llX",
+                     (unsigned)hc_miss->r31, (unsigned)hc_miss->r29,
+                     (unsigned)hc_miss->r4, (unsigned)hc_miss->r5,
+                     (unsigned)hc_miss->r6, (unsigned)hc_miss->r7,
+                     (unsigned long long)HH_RETURN_RVA());
+        } else {
+            snprintf(caller, sizeof(caller), "  caller (sin contexto) host_ret=exe+0x%llX",
+                     (unsigned long long)HH_RETURN_RVA());
+        }
+        fprintf(stderr, "Failed to find function at 0x%08X\n%s\n", addr, caller);
         // HH: además de stderr, dejarlo en hh_missing.log (CWD) para builds de Windows sin consola.
         if (FILE* mf = fopen("hh_missing.log", "a")) {
-            fprintf(mf, "Failed to find function at 0x%08X\n", addr);
+            fprintf(mf, "Failed to find function at 0x%08X\n%s\n", addr, caller);
             fclose(mf);
         }
+        // HH: volcado del objeto del llamante (s0/r16) y busqueda del valor corrupto, para localizar
+        // de que estructura sale el puntero. Solo diagnostico (una vez, al fallar).
+        if (FILE* df = fopen("hh_badlookup.log", "a")) {
+            uint8_t* rb = hh_get_rdram_base();
+            uint32_t s0 = hc_miss != nullptr ? (uint32_t)hc_miss->r16 : 0;
+            fprintf(df, "=== bad lookup target=%08X caller ra=%08X sp=%08X s0/r16=%08X r4=%08X r5=%08X host_ret=exe+0x%llX ===\n",
+                    (unsigned)addr, hc_miss ? (unsigned)hc_miss->r31 : 0, hc_miss ? (unsigned)hc_miss->r29 : 0,
+                    (unsigned)s0, hc_miss ? (unsigned)hc_miss->r4 : 0, hc_miss ? (unsigned)hc_miss->r5 : 0,
+                    (unsigned long long)HH_RETURN_RVA());
+            if (rb != nullptr && s0 >= 0x80000000u && s0 + 0x40 <= 0x80800000u) {
+                for (int row = 0; row < 0x40; row += 4) {
+                    uint32_t v = *(uint32_t*)&rb[(s0 + row) & 0x1FFFFFFFu];
+                    fprintf(df, "  s0+%02X = %08X\n", row, (unsigned)v);
+                }
+            }
+            if (rb != nullptr) {
+                int n = 0;
+                uint32_t bad = (uint32_t)addr;
+                for (uint32_t off = 0; off + 4 <= 0x800000u && n < 32; off += 4) {
+                    if (*(uint32_t*)&rb[off] == bad) {
+                        fprintf(df, "  valor %08X encontrado en guest %08X\n", bad, (unsigned)(off | 0x80000000u));
+                        ++n;
+                    }
+                }
+            }
+            fclose(df);
+        }
         if (getenv("HH_SOFT_LOOKUP") != nullptr) {
+            return soft_missing_func;
+        }
+        // HH: un target FUERA del rango de codigo (KSEG0 0x80000000..0x807FFFFF) no puede ser una
+        // funcion recompilada: es un puntero corrupto/centinela (p. ej. 0xFF7F84CD = centinela del
+        // juego al que se le perdio el bit 0x00800000). El juego lo usaba como "callback no
+        // habilitado"; devolver no-op equivale a lo que pretendia y evita el crash. Un target dentro
+        // del rango pero no registrado sigue abortando (para registrar mid-entries).
+        uint32_t uaddr = (uint32_t)addr;
+        if (uaddr < 0x80000000u || uaddr >= 0x80800000u) {
+            static int hh_invalid_targets = 0;
+            if (hh_invalid_targets < 20) {
+                ++hh_invalid_targets;
+                fprintf(stderr, "[LOOKUP] target fuera de rango %08X -> no-op (posible centinela)\n", uaddr);
+            }
             return soft_missing_func;
         }
         assert(false);

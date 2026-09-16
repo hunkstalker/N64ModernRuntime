@@ -706,6 +706,7 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
 extern "C" int hh_watch_active = 0;
 extern "C" unsigned int hh_watch_lo = 0;
 extern "C" unsigned int hh_watch_hi = 0;
+extern "C" uint8_t* hh_get_rdram_base(void);  // definido en events.cpp (valor actual en el watch)
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -745,7 +746,13 @@ static void hh_watch_init() {
     if (a == nullptr || *a == '\0') return;
     unsigned long v = strtoul(a, nullptr, 0);
     hh_watch_lo = (unsigned int)(v & 0x1FFFFFFFu);
-    hh_watch_hi = hh_watch_lo + 0x40;
+    // HH_WATCH_SIZE permite vigilar una sola palabra (p. ej. 4) para no saturar el log.
+    unsigned long sz = 0x40;
+    if (const char* s = getenv("HH_WATCH_SIZE")) {
+        if (*s != '\0') sz = strtoul(s, nullptr, 0);
+    }
+    if (sz < 4) sz = 4;
+    hh_watch_hi = hh_watch_lo + (unsigned int)sz;
     hh_watch_active = 1;
     fprintf(stderr, "[WATCH] vigilando RDRAM 0x%08X..0x%08X\n", hh_watch_lo, hh_watch_hi);
 }
@@ -773,8 +780,15 @@ static void hh_watch_log(const char* what, uint64_t off, uint32_t extra) {
     const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     void* ret = hh_watch_ret();
     unsigned long long ret_off = (hh_base != 0) ? (unsigned long long)((uintptr_t)ret - hh_base) : 0;
-    fprintf(f, "[WATCH] t=%.3f %s off=%05llX ra=%08X sp=%08X a0=%08X a1=%08X a2=%08X a3=%08X extra=%08X ret=%p (exe+0x%llX)\n",
-            t, what, (unsigned long long)off, ra, sp, a0, a1, a2, a3, extra, ret, ret_off);
+    // HH: valor ACTUAL en esa direccion (antes del acceso). Al cambiar a basura, la entrada justo
+    // anterior en el log identifica quien la escribio.
+    uint32_t val = 0;
+    if (uint8_t* rb = hh_get_rdram_base()) {
+        unsigned int o = (unsigned int)off & 0x1FFFFFFFu;
+        if (o + 4 <= 0x40000000u) val = *(uint32_t*)(rb + o);
+    }
+    fprintf(f, "[WATCH] t=%.3f %s off=%05llX val=%08X ra=%08X sp=%08X a0=%08X a1=%08X a2=%08X a3=%08X extra=%08X ret=%p (exe+0x%llX)\n",
+            t, what, (unsigned long long)off, val, ra, sp, a0, a1, a2, a3, extra, ret, ret_off);
 #if defined(_WIN32)
     {
         void* frames[16];
