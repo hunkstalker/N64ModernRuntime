@@ -870,13 +870,18 @@ static std::atomic<unsigned long long> hh_s0fix_counter{0};
 extern "C" unsigned long long hh_s0fix_hits(void) {
     return hh_s0fix_counter.load();
 }
+static thread_local uint32_t hh_last_valid_r16 = 0;
 static void hh_s0fix_check(uint32_t tgt, recomp_context* ctx) {
     if (getenv("HH_S0FIX") == nullptr || ctx == nullptr) return;
-    if ((tgt & 0xFFFF0000u) != 0x80020000u) return;   // solo el recvm principal (0x800266B0)
+    if ((tgt & 0xFFFF0000u) != 0x80020000u) return;   // solo el recv principal (0x800266B0)
     if ((tgt & 0xFFFFu) != 0x66B0u) return;
     uint32_t r16 = (uint32_t)ctx->r16;
-    if ((r16 & 0xFFFF0000u) == 0x80030000u) return;   // ya es el puntero de estado valido
-    if (r16 >= 0x80000000u && r16 < 0x80800000u) return; // otro puntero valido: no tocar
+    if (r16 >= 0x80000000u && r16 < 0x80800000u) {    // puntero valido: recordar el ultimo
+        hh_last_valid_r16 = r16;
+        return;
+    }
+    // r16 invalido: reparar SOLO si este hilo venia manteniendo el estado del bucle principal.
+    if (hh_last_valid_r16 != 0x80037748u) return;
     ctx->r16 = 0x80037748u;
     hh_s0fix_counter++;
     if (getenv("HH_MQLOG_ALL") != nullptr) {
