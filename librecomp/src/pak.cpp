@@ -105,7 +105,7 @@ static void hh_dump_state(uint8_t* rdram) {
             usados++;
         }
     }
-    hh_paklog("  estado: files=%zu usados=%d usados_bytes=%u libres=%u", g_pak.files.size(), usados,
+    hh_paklog("  estado: files=%u usados=%d usados_bytes=%u libres=%u", (unsigned)g_pak.files.size(), usados,
               (unsigned)pak_used_bytes(), (unsigned)(PAK_SIZE - pak_used_bytes()));
     for (int ch = 0; ch < 4; ch++) {
         const OSPfs* p = TO_PTR(OSPfs, HH_GAME_PFS_BASE + (uint32_t)ch * HH_GAME_PFS_STRIDE);
@@ -129,7 +129,7 @@ static void pak_save() {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
 
-    hh_paklog("pak_save path=%s files=%zu", path.string().c_str(), g_pak.files.size());
+    hh_paklog("pak_save path=%s files=%u", path.string().c_str(), (unsigned)g_pak.files.size());
 
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -192,7 +192,7 @@ static void pak_load() {
         }
         g_pak.files.push_back(std::move(f));
     }
-    hh_paklog("pak_load path=%s -> %zu ficheros", pak_path().string().c_str(), g_pak.files.size());
+    hh_paklog("pak_load path=%s -> %u ficheros", pak_path().string().c_str(), (unsigned)g_pak.files.size());
 }
 
 static void pak_ensure_loaded() {

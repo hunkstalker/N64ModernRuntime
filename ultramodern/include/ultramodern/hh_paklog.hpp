@@ -6,7 +6,7 @@
 //     trabajo (que run_windows.bat fija a build_win\bin\Release => al lado del exe).
 //   - HH_PAKLOG=0        -> desactivado.
 //   - HH_PAKLOG=<ruta>   -> fichero explícito (p. ej. una ruta de la carpeta compartida).
-//   - HH_PAKTEST=0       -> omite el autotest de la API PFS al primer uso.
+//   - HH_PAKTEST=1       -> ejecuta el autotest de la API PFS al primer uso (opt-in).
 // Se escribe una línea por evento y se hace flush, para que el final quede aunque el juego crashee.
 #pragma once
 
@@ -34,11 +34,10 @@ inline FILE* hh_paklog_file() {
         if (path == nullptr) {
             return nullptr;
         }
-        FILE* f = std::fopen(path, "w");
-        if (f != nullptr) {
-            std::setvbuf(f, nullptr, _IOLBF, 0);
-        }
-        return f;
+        // OJO: nada de setvbuf(_IOLBF, tamaño 0): en el CRT de Windows dispara el invalid
+        // parameter handler y el proceso muere con 0xC0000409 en la PRIMERA linea (el fichero se
+        // creaba vacio). Como hacemos fflush por linea, no hace falta.
+        return std::fopen(path, "w");
     }();
     return file;
 }
@@ -56,7 +55,8 @@ inline void hh_paklog(const char* fmt, ...) {
     std::fflush(f);
 }
 
+// Opt-in: solo con HH_PAKTEST=1 (evita riesgos de arranque; el autotest ya se validó en Linux).
 inline bool hh_paktest_enabled() {
     const char* env = std::getenv("HH_PAKTEST");
-    return !(env != nullptr && env[0] == '0' && env[1] == '\0');
+    return env != nullptr && env[0] == '1' && env[1] == '\0';
 }
