@@ -61,10 +61,11 @@ inline bool hh_paktest_enabled() {
     return env != nullptr && env[0] == '1' && env[1] == '\0';
 }
 
-// Pak nuevo: osPfsInitPak devuelve PFS_ERR_NEW_PACK mientras el pak no se haya escrito nunca.
-// El juego (dispatcher FUN_800183D0, op 2) crea entonces sus ficheros (allocate 0x3500). Activo por
-// defecto; HH_PAK_NEWPACK=0 lo desactiva (vuelve a "siempre formateado").
+// Pak nuevo (opt-in): con HH_PAK_NEWPACK=1, osPfsInitPak devuelve PFS_ERR_NEW_PACK mientras el pak
+// no se haya escrito nunca. NO se activa por defecto: el juego no tiene funcion de formateo en el
+// ROM y con ese estado se quedaba en bucle/crasheaba en GAME START. La libultra real devuelve 0 en un
+// pak ya formateado (como los de fabrica) y el juego crea su fichero cuando lo necesita.
 inline bool hh_pak_newpack_enabled() {
     const char* env = std::getenv("HH_PAK_NEWPACK");
-    return !(env != nullptr && env[0] == '0' && env[1] == '\0');
+    return env != nullptr && env[0] == '1' && env[1] == '\0';
 }

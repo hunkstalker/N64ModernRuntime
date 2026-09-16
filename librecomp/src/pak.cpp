@@ -309,7 +309,7 @@ extern "C" void osPfsAllocateFile_recomp(uint8_t* rdram, recomp_context* ctx) {
         HH_PAK_RET("osPfsAllocateFile", PFS_ERR_INVALID);
     }
     if (pak_used_bytes() + ((static_cast<uint32_t>(size) + 0xFF) & ~0xFFu) > PAK_SIZE) {
-        HH_PAK_RET("osPfsAllocateFile", PFS_ERR_INCONSISTENT);
+        HH_PAK_RET("osPfsAllocateFile", 9 /* PFS data full, como el ROM */);
     }
     int slot = -1;
     for (size_t i = 0; i < g_pak.files.size(); i++) {
@@ -320,7 +320,7 @@ extern "C" void osPfsAllocateFile_recomp(uint8_t* rdram, recomp_context* ctx) {
     }
     if (slot < 0) {
         if (g_pak.files.size() >= PAK_MAX_FILES) {
-            HH_PAK_RET("osPfsAllocateFile", PFS_ERR_INCONSISTENT);
+            HH_PAK_RET("osPfsAllocateFile", 9 /* PFS data full, como el ROM */);
         }
         g_pak.files.emplace_back();
         slot = static_cast<int>(g_pak.files.size()) - 1;
@@ -365,7 +365,11 @@ extern "C" void osPfsFindFile_recomp(uint8_t* rdram, recomp_context* ctx) {
     }
     int idx = pak_find(company, game, game_name, ext_name);
     if (idx < 0) {
-        HH_PAK_RET("osPfsFindFile", PFS_ERR_NO_FILE);
+        // Igual que la libultra del ROM (0x8002EFC8): *file_no = -1 y retorno 5. El wrapper del
+        // juego (FUN_80002DBC) solo entiende 0..5; devolver >=6 hacia que lo tomara por exito y
+        // dejara el file_no sin inicializar (de ahi los file_no basura 95/233/237).
+        *file_no = -1;
+        HH_PAK_RET("osPfsFindFile", PFS_ERR_INVALID);
     }
     *file_no = idx;
     HH_PAK_RET("osPfsFindFile", 0);
@@ -390,7 +394,7 @@ extern "C" void osPfsDeleteFile_recomp(uint8_t* rdram, recomp_context* ctx) {
     }
     int idx = pak_find(company, game, game_name, ext_name);
     if (idx < 0) {
-        HH_PAK_RET("osPfsDeleteFile", PFS_ERR_NO_FILE);
+        HH_PAK_RET("osPfsDeleteFile", PFS_ERR_INVALID); // el ROM tambien devuelve 5 (via FindFile)
     }
     PakFile& f = g_pak.files[idx];
     f.used = false;
