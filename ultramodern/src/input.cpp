@@ -1,8 +1,7 @@
 #include <cassert>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 
+#include "ultramodern/hh_paklog.hpp"
 #include "ultramodern/input.hpp"
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -230,11 +229,9 @@ s32 osMotorInit(RDRAM_ARG PTR(OSMesgQueue) mq, PTR(OSPfs) pfs_, int channel) {
         ret = 0;
     }
 
-    // HH: diagnostico del flujo de guardado/accesorios (HH_PAKLOG=1; nada sin el env).
-    if (std::getenv("HH_PAKLOG") != nullptr) {
-        std::fprintf(stderr, "[PAK] osMotorInit ch=%d dev=%d pak=%d -> %d\n", channel,
-                     (int)device_info.connected_device, (int)device_info.connected_pak, (int)ret);
-    }
+    // HH: diagnostico del flujo de guardado/accesorios -> hh_pak.log (ver hh_paklog.hpp).
+    hh_paklog("osMotorInit ch=%d dev=%d pak=%d -> %d", channel, (int)device_info.connected_device,
+              (int)device_info.connected_pak, (int)ret);
 
     return ret;
 }
