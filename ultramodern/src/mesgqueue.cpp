@@ -281,6 +281,31 @@ static bool remove_blocked_thread(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThr
 }
 
 bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block, PTR(OSThread) target) {
+    // HH: validar el puntero y los CAMPOS de la cola. Una cola corrupta (msgCount 0 -> division por
+    // cero; msg fuera de RDRAM -> escritura salvaje que NO pasa por los MEM_* y por tanto invisible
+    // al watchpoint) estaba escribiendo el mensaje encima de estructuras del juego.
+    {
+        uint32_t mp = (uint32_t)mq_;
+        if (mp != 0 && (mp < 0x80000000u || mp >= 0x80800000u || (mp & 3u))) {
+            static int hh_n = 0;
+            if (hh_n++ < 40) fprintf(stderr, "[BADMQ] fields ptr mq=%08X msg=%08X\n", mp, (unsigned)msg);
+            return false;
+        }
+        if (mp != 0) {
+            OSMesgQueue* mq_chk = TO_PTR(OSMesgQueue, mq_);
+            uint32_t mbuf = (uint32_t)mq_chk->msg;
+            if (mq_chk->msgCount <= 0 || mq_chk->msgCount > 0x10000 ||
+                mbuf < 0x80000000u || mbuf >= 0x80800000u || (mbuf & 3u)) {
+                static int hh_n = 0;
+                if (hh_n++ < 40) {
+                    fprintf(stderr, "[BADMQ] fields mq=%08X msgCount=%d valid=%d first=%d msg=%08X (msg=%08X)\n",
+                            mp, (int)mq_chk->msgCount, (int)mq_chk->validCount, (int)mq_chk->first,
+                            mbuf, (unsigned)msg);
+                }
+                return false;
+            }
+        }
+    }
     hh_gatelog(PASS_RDRAM "send", mq_, msg);
     hh_mqa_log(PASS_RDRAM "send", mq_, msg, jam ? 1 : 0);
     hh_mqlog(PASS_RDRAM "send-in", mq_, ultramodern::is_game_thread() ? ultramodern::this_thread() : NULLPTR, jam ? 1 : 0);
