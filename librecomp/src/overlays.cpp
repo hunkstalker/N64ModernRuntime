@@ -873,6 +873,12 @@ extern "C" unsigned long long hh_s0fix_hits(void) {
 static thread_local uint32_t hh_last_valid_r16 = 0;
 static void hh_s0fix_check(uint32_t tgt, recomp_context* ctx) {
     if (ctx == nullptr) return;
+    // Auto-test: HH_TEST_S0BUG=1 corrompe s0 una vez (viniendo de 0x80037748) para validar el fix.
+    static const bool s0bug = getenv("HH_TEST_S0BUG") != nullptr;
+    static thread_local int hh_s0bug_n = 0;
+    if (s0bug && tgt == 0x800266B0u && (uint32_t)ctx->r16 == 0x80037748u && hh_last_valid_r16 == 0x80037748u) {
+        if (++hh_s0bug_n == 60) { ctx->r16 = 0x00001E82u; fprintf(stderr, "[S0TEST] corrompiendo r16 a 1E82 (llamada %d del hilo principal)\n", hh_s0bug_n); }
+    }
     if ((tgt & 0xFFFF0000u) != 0x80020000u) return;   // solo el recv principal (0x800266B0)
     if ((tgt & 0xFFFFu) != 0x66B0u) return;
     uint32_t r16 = (uint32_t)ctx->r16;
