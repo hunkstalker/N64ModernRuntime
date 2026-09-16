@@ -872,7 +872,7 @@ extern "C" unsigned long long hh_s0fix_hits(void) {
 }
 static thread_local uint32_t hh_last_valid_r16 = 0;
 static void hh_s0fix_check(uint32_t tgt, recomp_context* ctx) {
-    if (getenv("HH_S0FIX") == nullptr || ctx == nullptr) return;
+    if (ctx == nullptr) return;
     if ((tgt & 0xFFFF0000u) != 0x80020000u) return;   // solo el recv principal (0x800266B0)
     if ((tgt & 0xFFFFu) != 0x66B0u) return;
     uint32_t r16 = (uint32_t)ctx->r16;
@@ -884,11 +884,10 @@ static void hh_s0fix_check(uint32_t tgt, recomp_context* ctx) {
     if (hh_last_valid_r16 != 0x80037748u) return;
     ctx->r16 = 0x80037748u;
     hh_s0fix_counter++;
-    if (getenv("HH_MQLOG_ALL") != nullptr) {
-        static FILE* ff = nullptr;
-        if (ff == nullptr) ff = fopen("hh_s0fix.log", "w");
-        if (ff != nullptr) { fprintf(ff, "[S0FIX] r16 %08X -> 80037748 (tgt=%08X)\n", r16, tgt); fflush(ff); }
-    }
+    static FILE* ff = nullptr;
+    if (ff == nullptr) ff = fopen("hh_s0fix.log", "w");
+    if (ff != nullptr) { fprintf(ff, "[S0FIX] r16 %08X -> 80037748 (tgt=%08X)\n", r16, tgt); fflush(ff); }
+    fprintf(stderr, "[S0FIX] r16 %08X -> 80037748 (recv del bucle principal)\n", r16);
 }
 
 extern "C" recomp_func_t * get_function(int32_t addr) {
