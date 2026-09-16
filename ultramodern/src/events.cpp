@@ -417,7 +417,7 @@ void vi_thread_func() {
                         if (dumpvi_list[i] != total_vis) continue;
                         uint8_t* g = events_context.rdram;
                         char path[512];
-                        snprintf(path, sizeof(path), "/app/hybrid-heaven-recomp/work/debug/port_vi%llu.bin", (unsigned long long)total_vis);
+                        snprintf(path, sizeof(path), "work/debug/port_vi%llu.bin", (unsigned long long)total_vis);
                         FILE* f = fopen(path, "wb");
                         if (f) { fwrite(g, 1, 0x800000, f); fclose(f); fprintf(stderr, "[DUMP] VI %llu -> %s\n", (unsigned long long)total_vis, path); }
                         break;
