@@ -893,7 +893,8 @@ static void hh_s0fix_check(uint32_t tgt, recomp_context* ctx) {
     static FILE* ff = nullptr;
     if (ff == nullptr) ff = fopen("hh_s0fix.log", "w");
     if (ff != nullptr) { fprintf(ff, "[S0FIX] r16 %08X -> 80037748 (work del bucle principal)\n", r16); fflush(ff); }
-    fprintf(stderr, "[S0FIX] r16 %08X -> 80037748 (work del bucle principal)\n", r16);
+    static int hh_s0fix_console = 0;
+    if (hh_s0fix_console < 20) { hh_s0fix_console++; fprintf(stderr, "[S0FIX] r16 %08X -> 80037748 (work del bucle principal)\n", r16); }
 }
 
 extern "C" recomp_func_t * get_function(int32_t addr) {
