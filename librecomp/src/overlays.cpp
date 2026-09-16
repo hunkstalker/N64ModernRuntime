@@ -871,29 +871,29 @@ extern "C" unsigned long long hh_s0fix_hits(void) {
     return hh_s0fix_counter.load();
 }
 static thread_local uint32_t hh_last_valid_r16 = 0;
+// HH: FIX del cuelgue por dano. El bucle principal (FUN_800011B0) guarda en s0 (r16) el puntero
+// de estado 0x80037748 y, tras llamar al "work" (0x8000290C), decide con el si ejecuta el frame
+// (FUN_80001454, poll de input) o un no-op. La cadena del frame (dispatcher FUN_80026fe8 y
+// compania) puede dejar s0 con otro valor (incluso un puntero "valido" a un modulo), y entonces el
+// frame no se vuelve a llamar (imagen congelada, motor vivo). 0x8000290C tiene UN SOLO call-site
+// (el bucle principal), asi que en su entrada forzamos el invariante s0=0x80037748 si no lo es.
 static void hh_s0fix_check(uint32_t tgt, recomp_context* ctx) {
     if (ctx == nullptr) return;
-    // Auto-test: HH_TEST_S0BUG=1 corrompe s0 una vez (viniendo de 0x80037748) para validar el fix.
+    // Auto-test: HH_TEST_S0BUG=1 corrompe s0 una vez (a un puntero 'valido') para validar el fix.
     static const bool s0bug = getenv("HH_TEST_S0BUG") != nullptr;
     static thread_local int hh_s0bug_n = 0;
-    if (s0bug && tgt == 0x800266B0u && (uint32_t)ctx->r16 == 0x80037748u && hh_last_valid_r16 == 0x80037748u) {
-        if (++hh_s0bug_n == 60) { ctx->r16 = 0x00001E82u; fprintf(stderr, "[S0TEST] corrompiendo r16 a 1E82 (llamada %d del hilo principal)\n", hh_s0bug_n); }
+    if (s0bug && tgt == 0x8000290Cu && (uint32_t)ctx->r16 == 0x80037748u) {
+        if (++hh_s0bug_n == 60) { ctx->r16 = 0x80249B80u; fprintf(stderr, "[S0TEST] corrompiendo r16 a 80249B80 (puntero 'valido')\n"); }
     }
-    if ((tgt & 0xFFFF0000u) != 0x80020000u) return;   // solo el recv principal (0x800266B0)
-    if ((tgt & 0xFFFFu) != 0x66B0u) return;
+    if (tgt != 0x8000290Cu) return;
     uint32_t r16 = (uint32_t)ctx->r16;
-    if (r16 >= 0x80000000u && r16 < 0x80800000u) {    // puntero valido: recordar el ultimo
-        hh_last_valid_r16 = r16;
-        return;
-    }
-    // r16 invalido: reparar SOLO si este hilo venia manteniendo el estado del bucle principal.
-    if (hh_last_valid_r16 != 0x80037748u) return;
+    if (r16 == 0x80037748u) return;
     ctx->r16 = 0x80037748u;
     hh_s0fix_counter++;
     static FILE* ff = nullptr;
     if (ff == nullptr) ff = fopen("hh_s0fix.log", "w");
-    if (ff != nullptr) { fprintf(ff, "[S0FIX] r16 %08X -> 80037748 (tgt=%08X)\n", r16, tgt); fflush(ff); }
-    fprintf(stderr, "[S0FIX] r16 %08X -> 80037748 (recv del bucle principal)\n", r16);
+    if (ff != nullptr) { fprintf(ff, "[S0FIX] r16 %08X -> 80037748 (work del bucle principal)\n", r16); fflush(ff); }
+    fprintf(stderr, "[S0FIX] r16 %08X -> 80037748 (work del bucle principal)\n", r16);
 }
 
 extern "C" recomp_func_t * get_function(int32_t addr) {
