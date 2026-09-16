@@ -60,8 +60,12 @@ struct PakFile {
 
 struct PakState {
     bool loaded = false;
+    bool formatted = false; // false mientras el pak no se haya escrito nunca -> PFS_ERR_NEW_PACK
     std::vector<PakFile> files;
 };
+
+// Bits de OSPfs::status en libultra.
+#define PFS_INITIALIZED 0x1
 
 static PakState g_pak;
 static bool g_in_paktest = false;
@@ -105,7 +109,8 @@ static void hh_dump_state(uint8_t* rdram) {
             usados++;
         }
     }
-    hh_paklog("  estado: files=%u usados=%d usados_bytes=%u libres=%u", (unsigned)g_pak.files.size(), usados,
+    hh_paklog("  estado: formatted=%d files=%u usados=%d usados_bytes=%u libres=%u",
+              g_pak.formatted ? 1 : 0, (unsigned)g_pak.files.size(), usados,
               (unsigned)pak_used_bytes(), (unsigned)(PAK_SIZE - pak_used_bytes()));
     for (int ch = 0; ch < 4; ch++) {
         const OSPfs* p = TO_PTR(OSPfs, HH_GAME_PFS_BASE + (uint32_t)ch * HH_GAME_PFS_STRIDE);
@@ -136,6 +141,7 @@ static void pak_save() {
         fprintf(stderr, "[PAK] no se pudo escribir %s\n", path.string().c_str());
         return;
     }
+    g_pak.formatted = true; // a partir de aqui el pak deja de ser "nuevo"
     const char magic[4] = {'H', 'H', 'P', 'K'};
     uint32_t count = static_cast<uint32_t>(g_pak.files.size());
     out.write(magic, 4);
@@ -156,6 +162,7 @@ static void pak_save() {
 
 static void pak_load() {
     g_pak.loaded = true;
+    g_pak.formatted = false;
     g_pak.files.clear();
     std::ifstream in(pak_path(), std::ios::binary);
     if (!in) {
@@ -169,6 +176,7 @@ static void pak_load() {
         hh_paklog("pak_load path=%s -> magic invalido (pak vacio)", pak_path().string().c_str());
         return;
     }
+    g_pak.formatted = true; // el fichero existe con nuestro magic -> el pak ya se escribio alguna vez
     in.read(reinterpret_cast<char*>(&count), 4);
     for (uint32_t i = 0; i < count && i < PAK_MAX_FILES; i++) {
         PakFile f;
@@ -219,7 +227,10 @@ static int pak_find(uint16_t company, uint32_t game, const uint8_t game_name[4],
 static void pak_init_fields(OSPfs* pfs, int channel) {
     memset(pfs, 0, sizeof(OSPfs));
     pfs->channel = channel;
-    pfs->status = 0;
+    pfs->status = PFS_INITIALIZED; // libultra marca el pak como inicializado tras osPfsInitPak
+    pfs->version = 2;              // PFS version de un Controller Pak estándar
+    pfs->dir_size = 16;            // entradas de directorio de un pak de 32 KB
+    pfs->inode_start_page = 2;
     pfs->banks = 1;
     pfs->activebank = 0;
     static const u8 id[8] = {'N', '6', '4', ' ', 'P', 'F', 'S', 0};
@@ -239,6 +250,11 @@ extern "C" void osPfsInitPak_recomp(uint8_t* rdram, recomp_context* ctx) {
     }
     pak_init_fields(pfs, channel);
     hh_dump_state(rdram);
+    // Pak nunca escrito -> "nuevo": el juego crea sus ficheros (allocate 0x3500, dispatcher 0x800183D0
+    // op 2). Con el pak ya escrito devuelve 0 como antes.
+    if (!g_pak.formatted && hh_pak_newpack_enabled()) {
+        HH_PAK_RET("osPfsInitPak", PFS_ERR_NEW_PACK);
+    }
     HH_PAK_RET("osPfsInitPak", 0);
 }
 
@@ -547,7 +563,7 @@ static void hh_pak_selftest() {
     ctx.r5 = 0x80003000u; // pfs de mentira
     ctx.r6 = 0;
     osPfsInitPak_recomp(rdram, &ctx);
-    fallos += (ctx.r2 != 0);
+    fallos += (ctx.r2 != 0 && ctx.r2 != PFS_ERR_NEW_PACK); // un pak virgen da NEW_PACK
 
     ctx = {};
     ctx.r29 = SP;
@@ -619,6 +635,13 @@ static void hh_pak_selftest() {
     ctx.r7 = NAME_A;
     MEM_W(0x10, SP) = NAME_B;
     osPfsDeleteFile_recomp(rdram, &ctx);
+    fallos += (ctx.r2 != 0);
+
+    // tras haberse escrito, el pak ya no es "nuevo": el segundo init debe dar 0
+    ctx = {};
+    ctx.r5 = 0x80003000u;
+    ctx.r6 = 0;
+    osPfsInitPak_recomp(rdram, &ctx);
     fallos += (ctx.r2 != 0);
 
     g_pak = std::move(saved);

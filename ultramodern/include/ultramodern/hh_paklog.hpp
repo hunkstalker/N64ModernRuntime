@@ -60,3 +60,11 @@ inline bool hh_paktest_enabled() {
     const char* env = std::getenv("HH_PAKTEST");
     return env != nullptr && env[0] == '1' && env[1] == '\0';
 }
+
+// Pak nuevo: osPfsInitPak devuelve PFS_ERR_NEW_PACK mientras el pak no se haya escrito nunca.
+// El juego (dispatcher FUN_800183D0, op 2) crea entonces sus ficheros (allocate 0x3500). Activo por
+// defecto; HH_PAK_NEWPACK=0 lo desactiva (vuelve a "siempre formateado").
+inline bool hh_pak_newpack_enabled() {
+    const char* env = std::getenv("HH_PAK_NEWPACK");
+    return !(env != nullptr && env[0] == '0' && env[1] == '\0');
+}
