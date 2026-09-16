@@ -766,7 +766,7 @@ static void hh_watch_log(const char* what, uint64_t off, uint32_t extra) {
         if (f == nullptr) { hh_watch_active = 0; return; }
         t0 = std::chrono::steady_clock::now();
     }
-    if (n >= 60000) { hh_watch_active = 0; return; }
+    if (n >= 500000) { hh_watch_active = 0; return; }
     n++;
     recomp_context* c = hh_get_current_ctx();
     uint32_t ra = (c != nullptr) ? (uint32_t)c->r31 : 0;
