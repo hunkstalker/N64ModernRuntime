@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -14,6 +16,25 @@
 // alto nivel de PFS (init/formato, asignación, búsqueda, lectura/escritura,
 // borrado y estado) sobre un pak de 32 KB con un sistema de ficheros simple.
 // Ver TODO #15.
+
+// --- Instrumentación de diagnóstico (HH_PAKLOG=1) ------------------------------------------
+// Traza cada llamada PFS y su retorno para diagnosticar el flujo de guardado del juego (capsula
+// -> detectar pak -> preguntar -> slots -> escribir). Sin el env no imprime nada.
+static bool hh_paklog_enabled() {
+    static const bool enabled = std::getenv("HH_PAKLOG") != nullptr;
+    return enabled;
+}
+
+#define PAKLOG(...) do { if (hh_paklog_enabled()) std::fprintf(stderr, "[PAK] " __VA_ARGS__); } while (0)
+
+// Registra el retorno de una función _recomp y lo devuelve (misma semántica que _return).
+#define PAK_RET(nombre, expr)                                                       \
+    do {                                                                            \
+        s32 hh_ret = (s32)(expr);                                                   \
+        PAKLOG("%s -> %d\n", (nombre), (int)hh_ret);                                \
+        _return<s32>(ctx, hh_ret);                                                  \
+        return;                                                                     \
+    } while (0)
 
 enum {
     PFS_ERR_NOPACK      = 1,
@@ -64,6 +85,8 @@ static void pak_save() {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
 
+    PAKLOG("pak_save path=%s files=%zu\n", path.string().c_str(), g_pak.files.size());
+
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) {
         fprintf(stderr, "[PAK] no se pudo escribir %s\n", path.string().c_str());
@@ -92,12 +115,14 @@ static void pak_load() {
     g_pak.files.clear();
     std::ifstream in(pak_path(), std::ios::binary);
     if (!in) {
+        PAKLOG("pak_load path=%s -> no existe (pak vacio)\n", pak_path().string().c_str());
         return;
     }
     char magic[4] = {};
     uint32_t count = 0;
     in.read(magic, 4);
     if (magic[0] != 'H' || magic[1] != 'H' || magic[2] != 'P' || magic[3] != 'K') {
+        PAKLOG("pak_load path=%s -> magic invalido (pak vacio)\n", pak_path().string().c_str());
         return;
     }
     in.read(reinterpret_cast<char*>(&count), 4);
@@ -123,6 +148,7 @@ static void pak_load() {
         }
         g_pak.files.push_back(std::move(f));
     }
+    PAKLOG("pak_load path=%s -> %zu ficheros\n", pak_path().string().c_str(), g_pak.files.size());
 }
 
 static void pak_ensure_loaded() {
@@ -167,12 +193,13 @@ extern "C" void osPfsInitPak_recomp(uint8_t* rdram, recomp_context* ctx) {
     int channel = _arg<2, int>(rdram, ctx);
     pak_ensure_loaded();
 
+    PAKLOG("osPfsInitPak ch=%d pfs=%p\n", channel, (void*)pfs);
+
     if (channel != 0 || pfs == nullptr) {
-        _return<s32>(ctx, PFS_ERR_INVALID);
-        return;
+        PAK_RET("osPfsInitPak", PFS_ERR_INVALID);
     }
     pak_init_fields(pfs, channel);
-    _return<s32>(ctx, 0);
+    PAK_RET("osPfsInitPak", 0);
 }
 
 // Formato: deja el pak vacío (el juego lo usa para formatear un pak nuevo).
@@ -181,14 +208,15 @@ extern "C" void osPfsInit_recomp(uint8_t* rdram, recomp_context* ctx) {
     int channel = _arg<2, int>(rdram, ctx);
     pak_ensure_loaded();
 
+    PAKLOG("osPfsInit (formato) ch=%d pfs=%p\n", channel, (void*)pfs);
+
     if (channel != 0 || pfs == nullptr) {
-        _return<s32>(ctx, PFS_ERR_INVALID);
-        return;
+        PAK_RET("osPfsInit", PFS_ERR_INVALID);
     }
     g_pak.files.clear();
     pak_save();
     pak_init_fields(pfs, channel);
-    _return<s32>(ctx, 0);
+    PAK_RET("osPfsInit", 0);
 }
 
 extern "C" void osPfsFreeBlocks_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -197,7 +225,9 @@ extern "C" void osPfsFreeBlocks_recomp(uint8_t* rdram, recomp_context* ctx) {
     if (bytes != nullptr) {
         *bytes = static_cast<s32>(PAK_SIZE - pak_used_bytes());
     }
-    _return<s32>(ctx, 0);
+    PAKLOG("osPfsFreeBlocks -> %d libres (bytes=%p)\n",
+           (int)(PAK_SIZE - pak_used_bytes()), (void*)bytes);
+    PAK_RET("osPfsFreeBlocks", 0);
 }
 
 extern "C" void osPfsAllocateFile_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -209,13 +239,15 @@ extern "C" void osPfsAllocateFile_recomp(uint8_t* rdram, recomp_context* ctx) {
     s32* file_no = _arg<6, s32*>(rdram, ctx);
     pak_ensure_loaded();
 
+    PAKLOG("osPfsAllocateFile co=%04x game=%08x size=%d usados=%u libres=%d\n",
+           (unsigned)company, (unsigned)game, (int)size, (unsigned)pak_used_bytes(),
+           (int)(PAK_SIZE - pak_used_bytes()));
+
     if (size < 0 || file_no == nullptr) {
-        _return<s32>(ctx, PFS_ERR_INVALID);
-        return;
+        PAK_RET("osPfsAllocateFile", PFS_ERR_INVALID);
     }
     if (pak_used_bytes() + ((static_cast<uint32_t>(size) + 0xFF) & ~0xFFu) > PAK_SIZE) {
-        _return<s32>(ctx, PFS_ERR_INCONSISTENT);
-        return;
+        PAK_RET("osPfsAllocateFile", PFS_ERR_INCONSISTENT);
     }
     int slot = -1;
     for (size_t i = 0; i < g_pak.files.size(); i++) {
@@ -226,8 +258,7 @@ extern "C" void osPfsAllocateFile_recomp(uint8_t* rdram, recomp_context* ctx) {
     }
     if (slot < 0) {
         if (g_pak.files.size() >= PAK_MAX_FILES) {
-            _return<s32>(ctx, PFS_ERR_INCONSISTENT);
-            return;
+            PAK_RET("osPfsAllocateFile", PFS_ERR_INCONSISTENT);
         }
         g_pak.files.emplace_back();
         slot = static_cast<int>(g_pak.files.size()) - 1;
@@ -246,8 +277,9 @@ extern "C" void osPfsAllocateFile_recomp(uint8_t* rdram, recomp_context* ctx) {
     f.size = static_cast<uint32_t>(size);
     f.data.assign(size, 0);
     *file_no = slot;
+    PAKLOG("osPfsAllocateFile file_no=%d\n", slot);
     pak_save();
-    _return<s32>(ctx, 0);
+    PAK_RET("osPfsAllocateFile", 0);
 }
 
 extern "C" void osPfsFindFile_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -258,17 +290,18 @@ extern "C" void osPfsFindFile_recomp(uint8_t* rdram, recomp_context* ctx) {
     s32* file_no = _arg<5, s32*>(rdram, ctx);
     pak_ensure_loaded();
 
+    PAKLOG("osPfsFindFile co=%04x game=%08x\n", (unsigned)company, (unsigned)game);
+
     if (game_name == nullptr || ext_name == nullptr || file_no == nullptr) {
-        _return<s32>(ctx, PFS_ERR_INVALID);
-        return;
+        PAK_RET("osPfsFindFile", PFS_ERR_INVALID);
     }
     int idx = pak_find(company, game, game_name, ext_name);
     if (idx < 0) {
-        _return<s32>(ctx, PFS_ERR_NO_FILE);
-        return;
+        PAK_RET("osPfsFindFile", PFS_ERR_NO_FILE);
     }
     *file_no = idx;
-    _return<s32>(ctx, 0);
+    PAKLOG("osPfsFindFile file_no=%d\n", idx);
+    PAK_RET("osPfsFindFile", 0);
 }
 
 extern "C" void osPfsDeleteFile_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -278,21 +311,21 @@ extern "C" void osPfsDeleteFile_recomp(uint8_t* rdram, recomp_context* ctx) {
     u8* ext_name = _arg<4, u8*>(rdram, ctx);
     pak_ensure_loaded();
 
+    PAKLOG("osPfsDeleteFile co=%04x game=%08x\n", (unsigned)company, (unsigned)game);
+
     if (game_name == nullptr || ext_name == nullptr) {
-        _return<s32>(ctx, PFS_ERR_INVALID);
-        return;
+        PAK_RET("osPfsDeleteFile", PFS_ERR_INVALID);
     }
     int idx = pak_find(company, game, game_name, ext_name);
     if (idx < 0) {
-        _return<s32>(ctx, PFS_ERR_NO_FILE);
-        return;
+        PAK_RET("osPfsDeleteFile", PFS_ERR_NO_FILE);
     }
     PakFile& f = g_pak.files[idx];
     f.used = false;
     f.size = 0;
     f.data.clear();
     pak_save();
-    _return<s32>(ctx, 0);
+    PAK_RET("osPfsDeleteFile", 0);
 }
 
 extern "C" void osPfsReadWriteFile_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -303,19 +336,19 @@ extern "C" void osPfsReadWriteFile_recomp(uint8_t* rdram, recomp_context* ctx) {
     u8* buffer = _arg<5, u8*>(rdram, ctx);
     pak_ensure_loaded();
 
+    PAKLOG("osPfsReadWriteFile file_no=%d %s off=%d size=%d\n", (int)file_no,
+           flag == OS_WRITE_FLAG ? "WRITE" : "READ", (int)offset, (int)size);
+
     if (file_no < 0 || static_cast<size_t>(file_no) >= g_pak.files.size() ||
         offset < 0 || size < 0 || buffer == nullptr) {
-        _return<s32>(ctx, PFS_ERR_INVALID);
-        return;
+        PAK_RET("osPfsReadWriteFile", PFS_ERR_INVALID);
     }
     PakFile& f = g_pak.files[file_no];
     if (!f.used) {
-        _return<s32>(ctx, PFS_ERR_INVALID);
-        return;
+        PAK_RET("osPfsReadWriteFile", PFS_ERR_INVALID);
     }
     if (static_cast<uint32_t>(offset) > f.size) {
-        _return<s32>(ctx, PFS_ERR_INVALID);
-        return;
+        PAK_RET("osPfsReadWriteFile", PFS_ERR_INVALID);
     }
     uint32_t count = static_cast<uint32_t>(size);
     if (static_cast<uint32_t>(offset) + count > f.size) {
@@ -332,7 +365,7 @@ extern "C" void osPfsReadWriteFile_recomp(uint8_t* rdram, recomp_context* ctx) {
             memcpy(buffer, f.data.data() + offset, count);
         }
     }
-    _return<s32>(ctx, 0);
+    PAK_RET("osPfsReadWriteFile", 0);
 }
 
 extern "C" void osPfsFileState_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -340,15 +373,15 @@ extern "C" void osPfsFileState_recomp(uint8_t* rdram, recomp_context* ctx) {
     s32 state_ptr = _arg<2, s32>(rdram, ctx);
     pak_ensure_loaded();
 
+    PAKLOG("osPfsFileState file_no=%d state=%p\n", (int)file_no, (void*)(intptr_t)state_ptr);
+
     if (file_no < 0 || static_cast<size_t>(file_no) >= g_pak.files.size() ||
         state_ptr == 0) {
-        _return<s32>(ctx, PFS_ERR_INVALID);
-        return;
+        PAK_RET("osPfsFileState", PFS_ERR_INVALID);
     }
     const PakFile& f = g_pak.files[file_no];
     if (!f.used) {
-        _return<s32>(ctx, PFS_ERR_INVALID);
-        return;
+        PAK_RET("osPfsFileState", PFS_ERR_INVALID);
     }
 
     MEM_W(state_ptr, 0x0) = f.size;
@@ -357,7 +390,9 @@ extern "C" void osPfsFileState_recomp(uint8_t* rdram, recomp_context* ctx) {
     for (int i = 0; i < 4; i++) {
         MEM_B(state_ptr, 0xA + i) = f.ext_name[i];
     }
-    _return<s32>(ctx, 0);
+    PAKLOG("osPfsFileState size=%u game=%08x co=%04x\n", (unsigned)f.size, (unsigned)f.game,
+           (unsigned)f.company);
+    PAK_RET("osPfsFileState", 0);
 }
 
 extern "C" void osPfsNumFiles_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -377,7 +412,8 @@ extern "C" void osPfsNumFiles_recomp(uint8_t* rdram, recomp_context* ctx) {
     if (files_used != nullptr) {
         *files_used = used;
     }
-    _return<s32>(ctx, 0);
+    PAKLOG("osPfsNumFiles max=%d usados=%d\n", PAK_MAX_FILES, used);
+    PAK_RET("osPfsNumFiles", 0);
 }
 
 extern "C" void osPfsIsPlug_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -386,7 +422,7 @@ extern "C" void osPfsIsPlug_recomp(uint8_t* rdram, recomp_context* ctx) {
     if (pattern != nullptr) {
         *pattern = 0x01; // pak presente en el canal 0
     }
-    _return<s32>(ctx, 0);
+    PAK_RET("osPfsIsPlug", 0);
 }
 
 extern "C" void osPfsChecker_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -394,11 +430,11 @@ extern "C" void osPfsChecker_recomp(uint8_t* rdram, recomp_context* ctx) {
     if (errors != nullptr) {
         *errors = 0;
     }
-    _return<s32>(ctx, 0);
+    PAK_RET("osPfsChecker", 0);
 }
 
 extern "C" void osPfsRepairId_recomp(uint8_t* rdram, recomp_context* ctx) {
-    _return<s32>(ctx, 0);
+    PAK_RET("osPfsRepairId", 0);
 }
 
 // Game Boy Pak: libultra `osGbpakInit` devuelve GB_PAK_ERR_NOPAK (0xB) cuando no hay accesorio.
@@ -410,5 +446,5 @@ extern "C" void osGbpakInit_recomp(uint8_t * rdram, recomp_context* ctx) {
         pfs->status = GB_PAK_ERR_NOPAK;
         pfs->channel = channel;
     }
-    _return<s32>(ctx, GB_PAK_ERR_NOPAK);
+    PAK_RET("osGbpakInit", GB_PAK_ERR_NOPAK);
 }

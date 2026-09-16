@@ -1,5 +1,7 @@
 #include <cassert>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 #include "ultramodern/input.hpp"
 #include "ultramodern/ultra64.h"
@@ -216,18 +218,25 @@ s32 osMotorInit(RDRAM_ARG PTR(OSMesgQueue) mq, PTR(OSPfs) pfs_, int channel) {
         device_info = input_callbacks.get_connected_device_info(channel);
     }
 
+    s32 ret;
     if (device_info.connected_device != ultramodern::input::Device::Controller) {
-        return PFS_ERR_CONTRFAIL;
-    }
-    if (device_info.connected_pak == ultramodern::input::Pak::None) {
-        return PFS_ERR_NOPACK;
-    }
-    if (device_info.connected_pak != ultramodern::input::Pak::RumblePak) {
-        return PFS_ERR_DEVICE;
+        ret = PFS_ERR_CONTRFAIL;
+    } else if (device_info.connected_pak == ultramodern::input::Pak::None) {
+        ret = PFS_ERR_NOPACK;
+    } else if (device_info.connected_pak != ultramodern::input::Pak::RumblePak) {
+        ret = PFS_ERR_DEVICE;
+    } else {
+        pfs->status = PFS_MOTOR_INITIALIZED;
+        ret = 0;
     }
 
-    pfs->status = PFS_MOTOR_INITIALIZED;
-    return 0;
+    // HH: diagnostico del flujo de guardado/accesorios (HH_PAKLOG=1; nada sin el env).
+    if (std::getenv("HH_PAKLOG") != nullptr) {
+        std::fprintf(stderr, "[PAK] osMotorInit ch=%d dev=%d pak=%d -> %d\n", channel,
+                     (int)device_info.connected_device, (int)device_info.connected_pak, (int)ret);
+    }
+
+    return ret;
 }
 
 s32 osMotorStop(RDRAM_ARG PTR(OSPfs) pfs) {
