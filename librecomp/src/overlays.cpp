@@ -859,6 +859,33 @@ static thread_local uint32_t hh_last_r16 = 0xFFFFFFFFu;
 static thread_local uint32_t hh_last_tgt = 0;
 static thread_local bool hh_main_seen = false;
 
+// HH: FIX del cuelgue por dano. El bucle principal (0x800011B0) guarda en s0 (r16) el puntero de
+// estado 0x80037748 y lo usa tras sus llamadas (frame/no-op). Algun camino del frame (dispatcher
+// FUN_80026fe8 y compania, simbolo sobredimensionado) deja s0 con un valor que ya no es un puntero
+// valido de RDRAM -> el check lee memoria invalida -> el frame no se vuelve a llamar (sin input
+// polls, imagen congelada; el resto del motor sigue). Reparamos SOLO el puntero invalido, en la
+// entrada del osRecvMesg del bucle principal, restaurando el invariante s0=0x80037748. Un valor
+// legitimo (0x800xxxxx) nunca se toca. Opt-in con HH_S0FIX=1.
+static std::atomic<unsigned long long> hh_s0fix_counter{0};
+extern "C" unsigned long long hh_s0fix_hits(void) {
+    return hh_s0fix_counter.load();
+}
+static void hh_s0fix_check(uint32_t tgt, recomp_context* ctx) {
+    if (getenv("HH_S0FIX") == nullptr || ctx == nullptr) return;
+    if ((tgt & 0xFFFF0000u) != 0x80020000u) return;   // solo el recvm principal (0x800266B0)
+    if ((tgt & 0xFFFFu) != 0x66B0u) return;
+    uint32_t r16 = (uint32_t)ctx->r16;
+    if ((r16 & 0xFFFF0000u) == 0x80030000u) return;   // ya es el puntero de estado valido
+    if (r16 >= 0x80000000u && r16 < 0x80800000u) return; // otro puntero valido: no tocar
+    ctx->r16 = 0x80037748u;
+    hh_s0fix_counter++;
+    if (getenv("HH_MQLOG_ALL") != nullptr) {
+        static FILE* ff = nullptr;
+        if (ff == nullptr) ff = fopen("hh_s0fix.log", "w");
+        if (ff != nullptr) { fprintf(ff, "[S0FIX] r16 %08X -> 80037748 (tgt=%08X)\n", r16, tgt); fflush(ff); }
+    }
+}
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
     hh_calltrace((uint32_t)addr);
     hh_callring_record((uint32_t)addr);
@@ -889,6 +916,10 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
     // HH: vigilancia del dispatch del bucle principal (livelock del dano): registra, en cada
     // llamada al frame (0x80001454) o al no-op (0x80001BB0), el registro s0 (r16) y el valor de
     // memoria que consulta el branch (lhu 0x0(s0)). Gated por HH_MQLOG_ALL.
+    {
+        recomp_context* hc_fix = hh_get_current_ctx();
+        hh_s0fix_check((uint32_t)addr, hc_fix);
+    }
     if (((uint32_t)addr == 0x80001454u || (uint32_t)addr == 0x80001BB0u ||
          (uint32_t)addr == 0x8000290Cu || (uint32_t)addr == 0x800266B0u) && getenv("HH_MQLOG_ALL") != nullptr) {
         recomp_context* hc = hh_get_current_ctx();
