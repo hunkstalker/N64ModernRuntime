@@ -14,10 +14,18 @@
 #include <iostream>
 #include <optional>
 #include <mutex>
+#include <thread>
+#include <vector>
 #include <array>
 #include <cinttypes>
 #include <cuchar>
 #include <charconv>
+
+// HH: capa de instrumentacion/diagnostico (canary, watchpoint de hardware, logs). Para una build
+// de release limpia: compilar con -DHH_DEBUG_TOOLS=0 (no hay salida por consola ni ficheros).
+#ifndef HH_DEBUG_TOOLS
+#define HH_DEBUG_TOOLS 1
+#endif
 
 #include "recomp.h"
 #include "librecomp/overlays.hpp"
@@ -866,8 +874,454 @@ extern "C" void hh_watch_dma(uint32_t dram, uint32_t size) {
     }
 }
 
+#if HH_DEBUG_TOOLS
+// =====================================================================================
+// HH: capa de debug "quien corrompe" (port nativo).
+//   HH_CANARY=0xADDR:SIZE[,0xADDR:SIZE...]  vigila el buffer RDRAM por frame (comparacion
+//                                           contra sombra) y caza escrituras que NO pasan
+//                                           por los MEM_* (runtime/do_send/DMA).
+//   HH_DRWATCH=0xADDR[,0xADDR...]           watchpoint de HARDWARE (solo Windows): para en la
+//                                           instruccion exacta que escribe esos 4 bytes.
+//   hh_direct_write(...) lo llaman las escrituras directas del runtime (do_send/do_recv).
+// Salidas: hh_canary.log (canary + escrituras directas) y hh_drwatch.log (hardware) junto al exe.
+// =====================================================================================
+
+extern "C" uint64_t hh_get_vi_count(void);
+extern "C" int hh_get_callring(recomp_context* c, uint32_t* out, int max);
+
+struct HhCanaryRange {
+    uint32_t addr;      // direccion guest (base 0x80000000)
+    uint32_t size;      // bytes
+    uint32_t off;       // offset fisico en RDRAM
+    uint8_t* shadow;    // copia del frame anterior
+};
+
+static HhCanaryRange hh_canary[4];
+static int hh_canary_n = 0;
+static int hh_canary_inited = 0;
+static FILE* hh_canary_fp = nullptr;
+static long hh_canary_lines = 0;
+
+static FILE* hh_canary_file() {
+    if (hh_canary_fp == nullptr) hh_canary_fp = fopen("hh_canary.log", "w");
+    return hh_canary_fp;
+}
+
+// Volca el anillo de las ultimas 16 llamadas guest de cada hilo de juego vivo. Da la ventana
+// (funciones) en la que ocurrio el cambio.
+static void hh_dump_thread_rings(FILE* f) {
+    for (auto& slot : hh_ctx_slots) {
+        recomp_context* c = slot.ctx.load();
+        if (c == nullptr) continue;
+        uint32_t ring[16];
+        int n = hh_get_callring(c, ring, 16);
+        fprintf(f, "      tid=%d sp=%08X last:", slot.tid.load(), (uint32_t)c->r29);
+        for (int i = 0; i < n; i++) fprintf(f, " %08X", ring[i]);
+        fprintf(f, "\n");
+    }
+}
+
+static bool hh_watched_hit(uint32_t guest_addr, uint32_t len) {
+    if (hh_canary_n == 0 && hh_watch_active == 0) return false;
+    uint32_t lo = guest_addr & 0x1FFFFFFFu;
+    uint32_t hi = lo + len;
+    for (int i = 0; i < hh_canary_n; i++) {
+        if (hi > hh_canary[i].off && lo < hh_canary[i].off + hh_canary[i].size) return true;
+    }
+    if (hh_watch_active && hi > hh_watch_lo && lo < hh_watch_hi) return true;
+    return false;
+}
+
+// Escritura directa del runtime a RDRAM (do_send/do_recv/DMA). `guest_addr` = destino guest.
+// Devuelve 1 si el destino cae en una zona vigilada.
+extern "C" int hh_direct_write(uint32_t guest_addr, uint32_t val, const char* where) {
+    if (!hh_watched_hit(guest_addr, 4)) return 0;
+    FILE* f = hh_canary_file();
+    if (f == nullptr || hh_canary_lines > 200000) return 1;
+    hh_canary_lines++;
+    recomp_context* c = hh_get_current_ctx();
+    uint32_t ra = c != nullptr ? (uint32_t)c->r31 : 0;
+    uint32_t sp = c != nullptr ? (uint32_t)c->r29 : 0;
+    uintptr_t base = hh_module_base();
+    void* ret = hh_watch_ret();
+    unsigned long long ret_off = base != 0 ? (unsigned long long)((uintptr_t)ret - base) : 0;
+    fprintf(f, "[WW] %s guest=%08X val=%08X ra=%08X sp=%08X ret=exe+0x%llX\n",
+            where, guest_addr, val, ra, sp, ret_off);
+    hh_dump_thread_rings(f);
+    fflush(f);
+    return 1;
+}
+
+extern "C" void hh_canary_init(void) {
+    const char* spec = getenv("HH_CANARY");
+    if (spec == nullptr || *spec == '\0') return;
+    char buf[512];
+    strncpy(buf, spec, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+    for (char* tok = strtok(buf, ","); tok != nullptr && hh_canary_n < 4; tok = strtok(nullptr, ",")) {
+        char* colon = strchr(tok, ':');
+        uint32_t size = 4;
+        if (colon != nullptr) { *colon = 0; size = (uint32_t)strtoul(colon + 1, nullptr, 16); }
+        uint32_t addr = (uint32_t)strtoul(tok, nullptr, 16);
+        if (size == 0) size = 4;
+        hh_canary[hh_canary_n].addr = addr;
+        hh_canary[hh_canary_n].size = size;
+        hh_canary[hh_canary_n].off = addr & 0x1FFFFFFFu;
+        hh_canary[hh_canary_n].shadow = nullptr;
+        hh_canary_n++;
+    }
+}
+
+// Llamado una vez por VI desde el hilo VI (events.cpp). Compara las regiones vigiladas word a
+// word contra la sombra y loguea los cambios con la ventana de llamadas de cada hilo.
+extern "C" void hh_canary_tick(void) {
+    if (hh_canary_n == 0) return;
+    uint8_t* rdram = hh_get_rdram_base();
+    if (rdram == nullptr) return;
+    if (!hh_canary_inited) {
+        hh_canary_inited = 1;
+        for (int i = 0; i < hh_canary_n; i++) {
+            hh_canary[i].shadow = (uint8_t*)malloc(hh_canary[i].size);
+            if (hh_canary[i].shadow != nullptr) {
+                memcpy(hh_canary[i].shadow, rdram + hh_canary[i].off, hh_canary[i].size);
+            }
+        }
+        fprintf(stderr, "[CANARY] vigilando %d rango(s)\n", hh_canary_n);
+        return;
+    }
+    static uint64_t last_vi = 0;
+    uint64_t vi = hh_get_vi_count();
+    if (vi == last_vi) return;
+    last_vi = vi;
+    for (int i = 0; i < hh_canary_n; i++) {
+        if (hh_canary[i].shadow == nullptr) continue;
+        uint8_t* cur = rdram + hh_canary[i].off;
+        for (uint32_t j = 0; j + 4 <= hh_canary[i].size; j += 4) {
+            uint32_t oldv, newv;
+            memcpy(&oldv, hh_canary[i].shadow + j, 4);
+            memcpy(&newv, cur + j, 4);
+            if (oldv == newv) continue;
+            FILE* f = hh_canary_file();
+            if (f != nullptr && hh_canary_lines <= 200000) {
+                hh_canary_lines++;
+                fprintf(f, "[CANARY] vi=%llu guest=%08X old=%08X new=%08X\n",
+                        (unsigned long long)vi, hh_canary[i].addr + j, oldv, newv);
+                hh_dump_thread_rings(f);
+                fflush(f);
+            }
+            memcpy(hh_canary[i].shadow + j, cur + j, 4);
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// HH: traza por funcion guest (HH_TRACE=0xADDR:etiqueta[,0xADDR:etiqueta...]). Se llama desde
+// get_function; vuelca args, ra/sp y, si procede, el estado del objeto de combate y los globales.
+// Sirve para ver la secuencia exacta del state machine (armer, modo, indice de tabla, setter...).
+// -------------------------------------------------------------------------------------
+struct HhTraceEntry { uint32_t addr; char label[32]; };
+static HhTraceEntry hh_trace_fn_list[16];
+static int hh_trace_fn_n = 0;
+struct HhTraceRange { uint32_t base; uint32_t size; };
+static HhTraceRange hh_trace_ranges[4];
+static int hh_trace_range_n = 0;
+static FILE* hh_trace_fp = nullptr;
+static long hh_trace_lines = 0;
+
+// HH: HH_DIAG=1 habilita los logs de diagnostico always-on (hh_sched/hh_pi/hh_mq/hh_cmds/hh_ovl/
+// hh_rsp). Por defecto OFF: escribirlos con fflush en cada evento degrada el pacing del juego, sobre
+// todo en filesystems lentos (9p/red). hh_state, hh_crash/hh_hang y los volcados de error siguen
+// siempre activos. Los logs opt-in (HH_TRACE, HH_WAITLOG, HH_MQLOG_ALL, HH_WATCH...) no cambian.
+extern "C" int hh_diag_enabled(void) {
+    static const int on = getenv("HH_DIAG") != nullptr ? 1 : 0;
+    return on;
+}
+
+// HH: RA del contexto guest en ejecucion (para instrumentar cesiones/bloqueos desde ultramodern).
+extern "C" uint32_t hh_guest_ra(void) {
+    recomp_context* c = hh_get_current_ctx();
+    return c ? (uint32_t)c->r31 : 0;
+}
+
+// HH: reloj monotono compartido por toda la instrumentacion (origen = primer uso). Permite
+// correlacionar trazas de subsistemas distintos ([TRACE], [GATE], [GATE2], [SUBM], [SCH]).
+extern "C" double hh_time_now(void) {
+    static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+extern "C" void hh_trace_init(void) {
+    const char* spec = getenv("HH_TRACE");
+    if (spec != nullptr && *spec != '\0') {
+        char buf[512];
+        strncpy(buf, spec, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = 0;
+        for (char* tok = strtok(buf, ","); tok != nullptr && hh_trace_fn_n < 16; tok = strtok(nullptr, ",")) {
+            char* colon = strchr(tok, ':');
+            if (colon == nullptr) continue;
+            *colon = 0;
+            hh_trace_fn_list[hh_trace_fn_n].addr = (uint32_t)strtoul(tok, nullptr, 16);
+            strncpy(hh_trace_fn_list[hh_trace_fn_n].label, colon + 1, sizeof(hh_trace_fn_list[0].label) - 1);
+            hh_trace_fn_list[hh_trace_fn_n].label[sizeof(hh_trace_fn_list[0].label) - 1] = 0;
+            hh_trace_fn_n++;
+        }
+    }
+    // HH_TRACE_RANGE=0xBASE:0xSIZE[,0xBASE:0xSIZE...] -> loguea CUALQUIER llamada dentro del rango
+    // (util para volcar toda la actividad de un modulo/overlay en una pasada).
+    const char* rspec = getenv("HH_TRACE_RANGE");
+    if (rspec != nullptr && *rspec != '\0') {
+        char buf[512];
+        strncpy(buf, rspec, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = 0;
+        for (char* tok = strtok(buf, ","); tok != nullptr && hh_trace_range_n < 4; tok = strtok(nullptr, ",")) {
+            char* colon = strchr(tok, ':');
+            if (colon == nullptr) continue;
+            *colon = 0;
+            hh_trace_ranges[hh_trace_range_n].base = (uint32_t)strtoul(tok, nullptr, 16);
+            hh_trace_ranges[hh_trace_range_n].size = (uint32_t)strtoul(colon + 1, nullptr, 16);
+            if (hh_trace_ranges[hh_trace_range_n].size == 0) hh_trace_ranges[hh_trace_range_n].size = 0x10000;
+            hh_trace_range_n++;
+        }
+    }
+    if (hh_trace_fn_n > 0 || hh_trace_range_n > 0) {
+        fprintf(stderr, "[TRACE] %d funcion(es) + %d rango(s) vigilados\n", hh_trace_fn_n, hh_trace_range_n);
+    }
+}
+
+extern "C" void hh_trace_fn(uint32_t addr) {
+    if (hh_trace_fn_n == 0 && hh_trace_range_n == 0) return;
+    char rng_label[32];
+    const char* label = nullptr;
+    for (int i = 0; i < hh_trace_fn_n; i++) {
+        if (hh_trace_fn_list[i].addr == addr) { label = hh_trace_fn_list[i].label; break; }
+    }
+    if (label == nullptr) {
+        for (int i = 0; i < hh_trace_range_n; i++) {
+            uint32_t off = addr - hh_trace_ranges[i].base;
+            if (off < hh_trace_ranges[i].size) {
+                snprintf(rng_label, sizeof(rng_label), "RANGE+%X", off);
+                label = rng_label;
+                break;
+            }
+        }
+    }
+    if (label == nullptr) return;
+    if (hh_trace_fp == nullptr) hh_trace_fp = fopen("hh_trace.log", "w");
+    if (hh_trace_fp == nullptr || hh_trace_lines > 2000000) return;
+    hh_trace_lines++;
+    uint8_t* r = hh_get_rdram_base();
+    recomp_context* c = hh_get_current_ctx();
+    const double hh_t = hh_time_now();
+    const int hh_tid = (r != nullptr && ultramodern::is_game_thread())
+                           ? (int)hh_sh_get_id(
+                                 (OSThread*)(r + hh_to_ptr_off((uint32_t)ultramodern::this_thread())))
+                           : -1;
+    uint32_t a0 = c ? (uint32_t)c->r4 : 0, a1 = c ? (uint32_t)c->r5 : 0;
+    uint32_t a2 = c ? (uint32_t)c->r6 : 0, a3 = c ? (uint32_t)c->r7 : 0;
+    uint32_t ra = c ? (uint32_t)c->r31 : 0, sp = c ? (uint32_t)c->r29 : 0;
+    if (r != nullptr) {
+        auto wp = [&](uint32_t a) -> uint32_t {
+            uint32_t o = a & 0x1FFFFFFFu;
+            return (o + 4 <= 0x800000u) ? *(uint32_t*)(r + o) : 0;
+        };
+        auto hp = [&](uint32_t a) -> uint16_t {
+            uint32_t o = (a ^ 2) & 0x1FFFFFFFu;
+            return (o + 2 <= 0x800000u) ? *(uint16_t*)(r + o) : 0;
+        };
+        auto hb = [&](uint32_t a) -> uint8_t {
+            uint32_t o = (a ^ 3) & 0x1FFFFFFFu;
+            return (o < 0x800000u) ? r[o] : 0;
+        };
+        // Estado del OBJETO REAL de la llamada (a0), dinamico (la direccion varia por partida).
+        bool ok = (a0 >= 0x80000000u && a0 + 0x90u <= 0x80800000u && (a0 & 3u) == 0);
+        auto wo = [&](uint32_t off) -> uint32_t { return ok ? wp(a0 + off) : 0; };
+        auto ho = [&](uint32_t off) -> uint16_t { return ok ? hp(a0 + off) : 0; };
+        fprintf(hh_trace_fp,
+                "[TRACE] t=%.3f tid=%d %-10s addr=%08X a0=%08X a1=%08X ra=%08X sp=%08X"
+                " | obj: 1C=%08X 20=%08X 24=%08X 2C=%08X 36=%04X 8C=%08X"
+                " | mode=%04X gD0=%08X flag=%02X\n",
+                hh_t, hh_tid, label, addr, a0, a1, ra, sp,
+                wo(0x1C), wo(0x20), wo(0x24), wo(0x2C), ho(0x36), wo(0x8C),
+                hp(0x801BBC1Cu), wp(0x801BBCD0u), hb(0x8017DD92u));
+    } else {
+        fprintf(hh_trace_fp, "[TRACE] t=%.3f tid=%d %-10s addr=%08X a0=%08X a1=%08X ra=%08X sp=%08X\n",
+                hh_t, hh_tid, label, addr, a0, a1, ra, sp);
+    }
+#if defined(_WIN32)
+    {
+        uintptr_t base = hh_module_base();
+        void* frames[4];
+        USHORT nf = CaptureStackBackTrace(0, 4, frames, nullptr);
+        fprintf(hh_trace_fp, "      bt:");
+        for (USHORT i = 0; i < nf; i++) {
+            fprintf(hh_trace_fp, " 0x%llX", (unsigned long long)((uintptr_t)frames[i] - base));
+        }
+        fprintf(hh_trace_fp, "\n");
+    }
+#endif
+    fflush(hh_trace_fp);
+}
+
+#if defined(_WIN32)
+#include <tlhelp32.h>
+
+// Watchpoint de hardware: DR0-DR3 apuntan a las palabras vigiladas (RW=escritura, 4 bytes).
+static uintptr_t hh_dr_addrs[4] = {};
+static int hh_dr_n = 0;
+static FILE* hh_dr_fp = nullptr;
+static long hh_dr_lines = 0;
+static uint32_t hh_dr_last[4] = {};
+static std::mutex hh_dr_mutex;
+static std::vector<DWORD> hh_dr_armed;
+
+static void hh_dr_arm(HANDLE th) {
+    CONTEXT c{};
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(th, &c)) return;
+    for (int i = 0; i < hh_dr_n; i++) (&c.Dr0)[i] = (DWORD64)hh_dr_addrs[i];
+    DWORD64 dr7 = 0x100 | 0x200;  // LE | GE (reporte exacto)
+    for (int i = 0; i < hh_dr_n; i++) {
+        dr7 |= (DWORD64)1 << (2 * i);            // L_i (local enable)
+        dr7 |= (DWORD64)0xD << (16 + 4 * i);     // RW=01 (write) + LEN=11 (4 bytes) -> bits 16..19
+    }
+    c.Dr7 = dr7;
+    SetThreadContext(th, &c);
+}
+
+static LONG CALLBACK hh_dr_veh(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    if (hh_dr_n == 0) return EXCEPTION_CONTINUE_SEARCH;
+    static thread_local int in_handler = 0;
+    if (in_handler) return EXCEPTION_CONTINUE_EXECUTION;
+    in_handler = 1;
+    // IMPORTANTE: limpiar Dr6 SIEMPRE y poner RF; si no, el single-step se re-dispara sin parar
+    // (era la causa de las "escrituras" espurias atribuidas a hh_canary_tick).
+    DWORD64 dr6 = ep->ContextRecord->Dr6;
+    ep->ContextRecord->Dr6 = 0;
+    ep->ContextRecord->EFlags |= 0x10000;  // RF (resume flag)
+    int slot = -1;
+    for (int i = 0; i < hh_dr_n; i++) {
+        if (dr6 & ((DWORD64)1 << i)) { slot = i; break; }
+    }
+    if (slot >= 0) {
+        uint8_t* rdram = hh_get_rdram_base();
+        uint32_t newv = 0;
+        if (rdram != nullptr) memcpy(&newv, (void*)hh_dr_addrs[slot], 4);
+        // Solo registrar cambios de valor (las escrituras del mismo valor son ruido).
+        if (newv != hh_dr_last[slot]) {
+            if (hh_dr_fp == nullptr) hh_dr_fp = fopen("hh_drwatch.log", "w");
+            if (hh_dr_fp != nullptr && hh_dr_lines <= 200000) {
+                hh_dr_lines++;
+                recomp_context* gc = hh_get_current_ctx();
+                uintptr_t base = hh_module_base();
+                void* frames[24];
+                USHORT nf = CaptureStackBackTrace(0, 24, frames, nullptr);
+                uint32_t guest = (uint32_t)((uintptr_t)hh_dr_addrs[slot] - (uintptr_t)rdram) | 0x80000000u;
+                fprintf(hh_dr_fp, "[DR] slot=%d guest=%08X old=%08X new=%08X tid=%lu rip=exe+0x%llX\n",
+                        slot, guest, hh_dr_last[slot], newv, (unsigned long)GetCurrentThreadId(),
+                        (unsigned long long)((uintptr_t)ep->ContextRecord->Rip - base));
+                fprintf(hh_dr_fp, "     bt:");
+                for (USHORT i = 0; i < nf; i++) {
+                    fprintf(hh_dr_fp, " 0x%llX", (unsigned long long)((uintptr_t)frames[i] - base));
+                }
+                fprintf(hh_dr_fp, "\n");
+                if (gc != nullptr) {
+                    fprintf(hh_dr_fp, "     guest ra=%08X sp=%08X s0=%08X a0=%08X a1=%08X a2=%08X a3=%08X\n",
+                            (uint32_t)gc->r31, (uint32_t)gc->r29, (uint32_t)gc->r16,
+                            (uint32_t)gc->r4, (uint32_t)gc->r5, (uint32_t)gc->r6, (uint32_t)gc->r7);
+                }
+                hh_dump_thread_rings(hh_dr_fp);
+                static int dumped = 0;
+                if (!dumped && rdram != nullptr) {
+                    dumped = 1;
+                    FILE* df = fopen("hh_drwatch_rdram.bin", "wb");
+                    if (df != nullptr) { fwrite(rdram, 1, 0x800000, df); fclose(df); }
+                }
+                fflush(hh_dr_fp);
+            }
+        }
+        hh_dr_last[slot] = newv;
+    }
+    in_handler = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Arma los DR en los hilos que aparezcan despues (el runtime crea hilos nuevos).
+static void hh_dr_watch_thread() {
+    for (;;) {
+        Sleep(250);
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) continue;
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+                {
+                    std::lock_guard<std::mutex> lock(hh_dr_mutex);
+                    bool found = false;
+                    for (DWORD id : hh_dr_armed) { if (id == te.th32ThreadID) { found = true; break; } }
+                    if (found) continue;
+                }
+                HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                                       FALSE, te.th32ThreadID);
+                if (th != nullptr) {
+                    SuspendThread(th);
+                    hh_dr_arm(th);
+                    ResumeThread(th);
+                    CloseHandle(th);
+                    std::lock_guard<std::mutex> lock(hh_dr_mutex);
+                    hh_dr_armed.push_back(te.th32ThreadID);
+                }
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+    }
+}
+
+extern "C" void hh_drwatch_init(uint8_t* rdram) {
+    const char* spec = getenv("HH_DRWATCH");
+    // Preferir la base viva (la que usan los accesos); init() recibe la misma, pero por si acaso.
+    if (uint8_t* rb = hh_get_rdram_base()) rdram = rb;
+    if (spec == nullptr || *spec == '\0' || rdram == nullptr) return;
+    char buf[256];
+    strncpy(buf, spec, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+    for (char* tok = strtok(buf, ","); tok != nullptr && hh_dr_n < 4; tok = strtok(nullptr, ",")) {
+        uint32_t addr = (uint32_t)strtoul(tok, nullptr, 16);
+        if ((addr & 3u) != 0) continue;
+        hh_dr_addrs[hh_dr_n] = (uintptr_t)(rdram + (addr & 0x1FFFFFFFu));
+        memcpy(&hh_dr_last[hh_dr_n], (void*)hh_dr_addrs[hh_dr_n], 4);
+        hh_dr_n++;
+    }
+    if (hh_dr_n == 0) return;
+    AddVectoredExceptionHandler(1, hh_dr_veh);
+    hh_dr_arm(GetCurrentThread());
+    {
+        std::lock_guard<std::mutex> lock(hh_dr_mutex);
+        hh_dr_armed.push_back(GetCurrentThreadId());
+    }
+    std::thread(hh_dr_watch_thread).detach();
+    fprintf(stderr, "[DRWATCH] %d watchpoint(s) de hardware armados\n", hh_dr_n);
+}
+#else
+extern "C" void hh_drwatch_init(uint8_t* rdram) { (void)rdram; }
+#endif
+
+#else  // !HH_DEBUG_TOOLS: stubs (release limpio, sin I/O ni consola)
+extern "C" int hh_direct_write(uint32_t, uint32_t, const char*) { return 0; }
+extern "C" void hh_canary_init(void) {}
+extern "C" void hh_canary_tick(void) {}
+extern "C" void hh_drwatch_init(uint8_t*) {}
+extern "C" void hh_trace_init(void) {}
+extern "C" void hh_trace_fn(uint32_t) {}
+#endif  // HH_DEBUG_TOOLS
+
 void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
     hh_watch_init();
+    hh_canary_init();
+    hh_drwatch_init(rdram);
+    hh_trace_init();
     // Initialize the overlays
     recomp::overlays::init_overlays();
     init_mmio(rdram);

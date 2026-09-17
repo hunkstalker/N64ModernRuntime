@@ -13,9 +13,25 @@
 
 #include "ultramodern/threads.hpp"
 
+// HH: RA guest del hilo en ejecucion (para saber DESDE DONDE se cede/bloquea). Implementado en
+// librecomp (recomp.cpp) para no arrastrar recomp_context a ultramodern.
+extern "C" uint32_t hh_guest_ra(void);
+extern "C" double hh_time_now(void);
+
+// HH: tiempo que lleva el hilo host actual ejecutando sin ceder (desde su ultimo wake). Lo usa el
+// quantum de cesion de las ops de cola (mesgqueue.cpp) para no ceder en cada osSendMesg.
+static thread_local double hh_wake_t = -1.0;
+extern "C" double hh_thread_run_ms(void) {
+    if (hh_wake_t < 0.0) return 0.0;
+    return (hh_time_now() - hh_wake_t) * 1000.0;
+}
+
 // HH: traza del scheduler cooperativo (hh_sched.log, acotado): encolar/parar/despertar/siguiente por
 // hilo. Imprescindible en cuelgues donde un hilo parece despertado pero nunca vuelve a ejecutarse.
+// Gated por HH_DIAG=1 (si no, no se escribe: el flush por linea degrada el pacing).
+extern "C" int hh_diag_enabled(void);
 extern "C" void hh_schedlog(const char* fmt, ...) {
+    if (!hh_diag_enabled()) return;
     static FILE* f = nullptr;
     static long total = 0;
     static std::chrono::steady_clock::time_point t0{};
@@ -281,11 +297,12 @@ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
     // Release the game lock so the thread being resumed can acquire it and run; then park this
     // thread. Re-acquire the lock once we're resumed.
     if (ultramodern::is_game_thread()) {
-        hh_schedlog("park tid=%d\n", (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread())));
+        hh_schedlog("park tid=%d ra=%08X\n", (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread())), hh_guest_ra());
     }
     ultramodern::release_game_lock();
     thread_context->running.wait();
     ultramodern::acquire_game_lock();
+    hh_wake_t = hh_time_now();
     if (ultramodern::is_game_thread()) {
         hh_schedlog("wake tid=%d\n", (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread())));
     }
@@ -327,7 +344,7 @@ void ultramodern::run_next_thread_and_wait(RDRAM_ARG1) {
     // HH: contexto propio del hilo (thread_local), no `thread_self->context` (struct guest, puede
     // estar destruido/reutilizado por el juego). Fallback al struct si no se inicializo (boot).
     UltraThreadContext* cur_context = self_context != nullptr ? self_context : TO_PTR(OSThread, thread_self)->context;
-    hh_schedlog("rntw tid=%d\n", (int)hh_sh_get_id(TO_PTR(OSThread, thread_self)));
+    hh_schedlog("rntw tid=%d ra=%08X\n", (int)hh_sh_get_id(TO_PTR(OSThread, thread_self)), hh_guest_ra());
     // If there are no runnable game threads, idle on external (hardware/OS) messages instead of
     // aborting. Processing an external message on this game thread delivers it under the game
     // lock and may schedule a thread blocked on receive into the running queue. (racer patch:
@@ -352,6 +369,7 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
     thread_self = self_;
     is_game_thread = true;
     self_context = thread_context;
+    hh_wake_t = hh_time_now();
 
     // Keep the game's __osRunningThread global (0x80049940) in sync so that
     // game code that reads the current thread directly sees the right value.

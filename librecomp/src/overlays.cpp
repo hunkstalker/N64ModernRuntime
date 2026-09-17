@@ -34,8 +34,10 @@ static recomp::overlays::overlay_section_table_data_t sections_info {};
 static recomp::overlays::overlays_by_index_t overlays_info {};
 
 // HH: registro con marca de tiempo de carga de overlays/modulos (hh_ovl.log, acotado) para
-// correlacionar escenas y transiciones con hh_state.log y hh_pi.log.
+// correlacionar escenas y transiciones con hh_state.log y hh_pi.log. Gated por HH_DIAG=1.
+extern "C" int hh_diag_enabled(void);
 static void hh_ovl_log(const char* fmt, ...) {
+    if (!hh_diag_enabled()) return;
     static FILE* f = nullptr;
     static long total = 0;
     static std::chrono::steady_clock::time_point t0{};
@@ -191,6 +193,79 @@ void recomp::overlays::add_loaded_function(int32_t ram, recomp_func_t* func) {
     func_map[ram] = func;
 }
 
+// HH: diagnostico de PROPIEDAD de direcciones en func_map (HH_FUNC_OWNER=0x...,...). Logea a stderr
+// que seccion registra/borra cada direccion vigilada y a que funcion resuelve get_function. Sirve
+// para cazar entradas rancias cuando dos modulos comparten base (p. ej. M8/M23 en 0x801C1EE0).
+static bool hh_owner_watched(uint32_t a) {
+    static uint32_t addrs[16];
+    static size_t count = (size_t)-1;
+    if (count == (size_t)-1) {
+        count = 0;
+        const char* spec = getenv("HH_FUNC_OWNER");
+        if (spec != nullptr && *spec != '\0') {
+            char buf[512];
+            strncpy(buf, spec, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = 0;
+            for (char* tok = strtok(buf, ","); tok != nullptr && count < 16; tok = strtok(nullptr, ",")) {
+                addrs[count++] = (uint32_t)strtoul(tok, nullptr, 16);
+            }
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (addrs[i] == a) return true;
+    }
+    return false;
+}
+
+extern "C" uint64_t hh_get_vi_count(void);
+extern "C" uint64_t hh_replay_get_sample(void);
+
+// HH: traza BASE-AWARE por offset de modulo (HH_MODTRACE=[rom:]offset:label,...). Localiza la
+// seccion cargada que contiene la direccion y compara el offset, asi funciona aunque el modulo
+// este REUBICADO (p. ej. modulo 23 en 0x801FA948). Con rom=0 (u omitido) vale cualquier modulo.
+static bool hh_modtrace_match(uint32_t addr, const char** label_out) {
+    const char* spec = getenv("HH_MODTRACE");
+    if (spec == nullptr || *spec == '\0') return false;
+    char buf[512];
+    strncpy(buf, spec, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+    for (char* tok = strtok(buf, ","); tok != nullptr; tok = strtok(nullptr, ",")) {
+        char* c1 = strchr(tok, ':');
+        if (c1 == nullptr) continue;
+        *c1 = 0;
+        char* c2 = strchr(c1 + 1, ':');
+        uint32_t rom = 0, off = 0;
+        const char* lab;
+        if (c2 != nullptr) {
+            *c2 = 0;
+            rom = (uint32_t)strtoul(tok, nullptr, 16);
+            off = (uint32_t)strtoul(c1 + 1, nullptr, 16);
+            lab = c2 + 1;
+        } else {
+            off = (uint32_t)strtoul(tok, nullptr, 16);
+            lab = c1 + 1;
+        }
+        for (const auto& ls : loaded_sections) {
+            const SectionTableEntry& sec = sections_info.code_sections[ls.section_table_index];
+            uint32_t base = (uint32_t)ls.loaded_ram_addr;
+            if (addr >= base && addr < base + (uint32_t)sec.size) {
+                if ((addr - base) == off && (rom == 0 || rom == (sec.rom_addr & 0x1FFFFFFFu))) {
+                    *label_out = lab;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static void hh_owner_log(const char* what, uint32_t addr, const void* func, long section = -1) {
+    if (!hh_owner_watched(addr)) return;
+    static long lines = 0;
+    if (lines++ > 20000) return;
+    fprintf(stderr, "[OWNER] %s section=%ld addr=%08X func=%p\n", what, section, addr, func);
+}
+
 // HH: registra el módulo recompilado que corresponde al blob de ROM que el juego carga.
 void recomp::overlays::register_module_sources(const ModuleSource* sources, size_t count) {
     module_sources.clear();
@@ -214,6 +289,9 @@ void recomp::overlays::register_flat_code() {
         const SectionTableEntry& section = sections_info.code_sections[section_index];
         for (size_t function_index = 0; function_index < section.num_funcs; function_index++) {
             const FuncEntry& func = section.funcs[function_index];
+            if (hh_owner_watched(section.ram_addr + func.offset)) {
+                hh_owner_log("flat-load", section.ram_addr + func.offset, (const void*)func.func, (long)section_index);
+            }
             func_map[section.ram_addr + func.offset] = func.func;
         }
     }
@@ -225,8 +303,28 @@ void load_overlay(size_t section_table_index, int32_t ram) {
                (unsigned)section.index, (unsigned)section.rom_addr, (unsigned)ram,
                (size_t)section.num_funcs);
 
+    // HH: borrado del rango al cargar (`HH_RANGECLEAR=1`, OPT-IN). Probado en el replay Linux: no
+    // cambia el desenlace del CaC (estado 0x801CC8C4 igual, mismo freeze) y las entradas "rancias"
+    // de 0x801C40EC/40F8 solo se usan ANTES de que cargue la seccion que reutiliza la base. Se deja
+    // disponible para experimentos, desactivado por defecto para no alterar el comportamiento.
+    if (getenv("HH_RANGECLEAR") != nullptr) {
+        const uint32_t hh_lo = (uint32_t)ram;
+        const uint32_t hh_hi = hh_lo + (uint32_t)section.size;
+        for (auto it = func_map.begin(); it != func_map.end();) {
+            uint32_t a = (uint32_t)it->first;
+            if (a >= hh_lo && a < hh_hi) {
+                it = func_map.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     for (size_t function_index = 0; function_index < section.num_funcs; function_index++) {
         const FuncEntry& func = section.funcs[function_index];
+        if (hh_owner_watched(ram + func.offset)) {
+            hh_owner_log("load", ram + func.offset, (const void*)func.func, (long)section_table_index);
+        }
         func_map[ram + func.offset] = func.func;
     }
 
@@ -249,6 +347,9 @@ void recomp::overlays::load_module_by_source(uint32_t src_rom, int32_t ram_addr)
                 fprintf(stderr, "[OVL] src=%06X -> section[%zu] rom=%08X at %08X\n",
                         (unsigned)(src_rom & 0x1FFFFFFFu), i, (unsigned)it->second, (unsigned)ram_addr);
             }
+            // HH (revertido): se probó a desregistrar la sección anterior al reutilizar base, pero
+            // NO cambió el bloqueo de combate (misma cadena de módulo 23, mismo estado). Se restaura
+            // el comportamiento original para no dejar cambios no validados.
             load_overlay(i, ram_addr);
             return;
         }
@@ -308,6 +409,7 @@ extern "C" void unload_overlay_by_id(uint32_t id) {
         for (size_t func_index = 0; func_index < section.num_funcs; func_index++) {
             const auto& func = section.funcs[func_index];
             uint32_t func_address = func.offset + find_it->loaded_ram_addr;
+            if (hh_owner_watched(func_address)) hh_owner_log("unload", func_address, nullptr, (long)section_table_index);
             func_map.erase(func_address);
         }
         // Reset the section's address in the address table
@@ -486,11 +588,16 @@ static bool hh_trc() {
     static const bool enabled = getenv("HH_TRCTRACE") != nullptr;
     return enabled;
 }
+static bool hh_is_burst_id(uint32_t id);
+static int hh_ms_now();
 static void hh_wrap_FUN_80017064(uint8_t* rdram, recomp_context* ctx) {
     uint32_t id = (uint32_t)ctx->r4 & 0xFFFF;
     uint32_t sp_before = (uint32_t)ctx->r29;
     uint32_t ra_before = (uint32_t)ctx->r31;
     hh_real_FUN_80017064(rdram, ctx);
+    if (getenv("HH_LSTTRACE") != nullptr && hh_is_burst_id(id)) {
+        fprintf(stderr, "[LST] t=%d 17064 id=%u -> %08X\n", hh_ms_now(), id, (unsigned)ctx->r2);
+    }
     if ((id != 0 && hh_trc()) || id == 0x74) {
         auto r16 = [&](uint32_t a){ return *(uint16_t*)&rdram[(a ^ 2) & 0x7FFFFF]; };
         fprintf(stderr, "[TRC] FIND(0x%04X) END -> 0x%08X sp=%08X->%08X ra=%08X->%08X tbl=%04X %04X %04X %04X\n", id,
@@ -589,15 +696,38 @@ static void hh_wrap_FUN_80035050(uint8_t* rdram, recomp_context* ctx) {
 }
 // HH: args del loader (a0=src ROM, a1=dest, a2=size, a3=end descomp.). Tras la descompresión,
 // registra la sección recompilada del módulo en la base real (reutilización de bases).
+// HH: dispatcher de recarga por id (FUN_8000469C): a0=id, a1=dst, tablas en 0x80038FF0 (pares
+// low/high con flag 0x80000000 en low) y 0x80037C5C. Traza para el diferencial CaC (carga #22).
+static recomp_func_t* hh_real_FUN_8000469c = nullptr;
+static void hh_wrap_FUN_8000469c(uint8_t* rdram, recomp_context* ctx) {
+    uint32_t id = (uint32_t)ctx->r4, dst = (uint32_t)ctx->r5, ra = (uint32_t)ctx->r31;
+    if (getenv("HH_DTTRACE") != nullptr) {
+        auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+        uint32_t o = (id - 1) * 4, o2 = (id - 1) * 8;
+        fprintf(stderr, "[DT] id=%u dst=%08X ra=%08X low=%08X high=%08X t2=%08X,%08X\n", id, dst, ra,
+                r32(0x80038FF0 + o), r32(0x80038FF4 + o), r32(0x80037C5C + o2), r32(0x80037C5C + o2 + 4));
+    }
+    hh_real_FUN_8000469c(rdram, ctx);
+    if (getenv("HH_DTTRACE") != nullptr) {
+        fprintf(stderr, "[DT]   id=%u ret=%08X\n", id, (unsigned)ctx->r2);
+    }
+}
 static recomp_func_t* hh_real_FUN_80003824 = nullptr;
 static void hh_wrap_FUN_80003824(uint8_t* rdram, recomp_context* ctx) {
     uint32_t src = (uint32_t)ctx->r4;
     uint32_t dst = (uint32_t)ctx->r5;
     if (getenv("HH_TBLTRACE") != nullptr) {
-        fprintf(stderr, "[LD384] a0=%08X a1=%08X a2=%08X a3=%08X\n",
-                src, dst, (unsigned)ctx->r6, (unsigned)ctx->r7);
+        fprintf(stderr, "[LD384] a0=%08X a1=%08X a2=%08X a3=%08X s=%llu\n",
+                src, dst, (unsigned)ctx->r6, (unsigned)ctx->r7,
+                (unsigned long long)hh_replay_get_sample());
     }
     hh_real_FUN_80003824(rdram, ctx);
+    // HH: tras la descompresion, el byte en 0x801CC8C4 (offset 0xD724 de la base 0x801BF1A0) dice
+    // si el "estado" del selector es DATO del modulo cargado.
+    if (getenv("HH_TBLTRACE") != nullptr) {
+        uint32_t b = (dst == 0x801BF1A0u) ? (uint32_t)rdram[(0x1CC8C4 ^ 3) & 0x7FFFFF] : 0xFFFFFFFFu;
+        fprintf(stderr, "[LD384] post dst=%08X 0x801CC8C4=%02X\n", dst, (unsigned)(b & 0xFF));
+    }
     recomp::overlays::load_module_by_source(src, (int32_t)dst);
 }
 // HH: cadena del nodo de boot: setter de callback (FUN_800058DC), dispatcher y pasos del
@@ -694,6 +824,269 @@ static void hh_wrap_FUN_801C5A0C(uint8_t* rdram, recomp_context* ctx) {
 static int hh_ms_now() {
     static const auto t0 = std::chrono::steady_clock::now();
     return (int)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+// HH: listas de carga de recursos (CaC). FUN_80004310 registra un puntero en 0x800894F4[cnt] (cnt
+// en byte 0x8008946D); FUN_8000433C las procesa (hasta 8 entradas de 8 bytes por llamada) y carga
+// cada id con FUN_800045E8/80004664/80004484. Evidencia del diferencial de la carga #22.
+static bool hh_is_burst_id(uint32_t id) {
+    static const uint16_t ids[] = {330,348,180,189,331,333,334,335,336,181,184,127,130,133,152};
+    for (uint16_t v : ids) if (id == v) return true;
+    return false;
+}
+static recomp_func_t* hh_real_FUN_80004310 = nullptr;
+static void hh_wrap_FUN_80004310(uint8_t* rdram, recomp_context* ctx) {
+    uint32_t ptr = (uint32_t)ctx->r4;
+    if (getenv("HH_LSTTRACE") != nullptr) {
+        auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+        uint32_t cnt = (uint32_t)rdram[(0x8008946D ^ 3) & 0x7FFFFF];
+        fprintf(stderr, "[LST] t=%d REG ptr=%08X cnt=%u ra=%08X\n", hh_ms_now(), ptr, cnt, (unsigned)ctx->r31);
+        for (int i = 0; i < 16; ++i) {
+            uint32_t e0 = r32(ptr + i * 8), e1 = r32(ptr + i * 8 + 4);
+            fprintf(stderr, "[LST]   e[%d] %08X %08X (id=%04X arg=%08X)%s\n", i, e0, e1,
+                    e0 & 0xFFFF, e1, (e0 & 0x40000000) ? " END" : "");
+            if (e0 & 0x40000000) break;
+        }
+    }
+    hh_real_FUN_80004310(rdram, ctx);
+}
+// HH: cargador de recursos de la seccion 7 (M24_FUN_801c242c): a0=indice (tabla 0x80171CF0),
+// a1=salida. Carga 2 ids del descriptor [tabla[a0-1]]. Es el llamante de la rafaga #22 del CaC.
+static void hh_log_m24(uint8_t* rdram, recomp_context* ctx, const char* tag) {
+    auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+    auto r16 = [&](uint32_t a){ return (uint32_t)*(uint16_t*)&rdram[(a ^ 2) & 0x7FFFFF]; };
+    uint32_t idx = (uint32_t)ctx->r4, arg = (uint32_t)ctx->r5;
+    uint32_t desc = r32(0x80171CF0 + idx * 4 - 4);
+    uint32_t p = desc ? r32(desc) : 0;
+    uint32_t id1 = p ? (r16(p) & 0xFFFF) : 0xFFFF, id2 = p ? (r16(p + 2) & 0xFFFF) : 0xFFFF;
+    fprintf(stderr, "[LST] t=%d vi=%llu %s idx=%u arg=%08X p=%08X id1=%u id2=%u\n",
+            hh_ms_now(), (unsigned long long)hh_get_vi_count(), tag, idx, arg, p, id1, id2);
+}
+static recomp_func_t* hh_real_M24_FUN_801c2420 = nullptr;
+static void hh_wrap_M24_FUN_801c2420(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) hh_log_m24(rdram, ctx, "M24C@2420");
+    hh_real_M24_FUN_801c2420(rdram, ctx);
+}
+static recomp_func_t* hh_real_M24_FUN_801c242c = nullptr;
+static void hh_wrap_M24_FUN_801c242c(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) hh_log_m24(rdram, ctx, "M24C@242c");
+    hh_real_M24_FUN_801c242c(rdram, ctx);
+}
+// HH: driver de la linea temporal de escena (M24_FUN_801bfaa0) y sus ayudantes. g2=[0x801D8CE8]
+// selecciona el "periodo"; el incrementador M24_FUN_801bffac avanza de periodo (aqui murio el CaC).
+static recomp_func_t* hh_real_M24_FUN_801bfaa0 = nullptr;
+static void hh_wrap_M24_FUN_801bfaa0(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) {
+        auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+        uint32_t tl = r32(0x801D8CE4), g2 = r32(0x801D8CE8), cnt = r32(0x801D8CF0);
+        uint32_t tlbase = r32(0x801D8C00 + tl * 4);
+        uint32_t per = tlbase ? r32(tlbase + g2 * 4) : 0;
+        uint32_t ent = per ? r32(per + cnt * 0x18) : 0, val = per ? r32(per + cnt * 0x18 + 4) : 0;
+        static unsigned long long n = 0;
+        if (n < 40 || (n % 200) == 0) {
+            fprintf(stderr, "[TL] t=%d vi=%llu n=%llu tl=%u g2=%u cnt=%u per=%08X ent=%08X val=%08X\n",
+                hh_ms_now(), (unsigned long long)hh_get_vi_count(), n, tl, g2, cnt, per, ent, val);
+        }
+        n++;
+    }
+    hh_real_M24_FUN_801bfaa0(rdram, ctx);
+}
+static recomp_func_t* hh_real_M24_FUN_801bffac = nullptr;
+static void hh_wrap_M24_FUN_801bffac(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) {
+        auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+        fprintf(stderr, "[TL] t=%d vi=%llu ADVANCE g2: %u -> %u (cnt=%u)\n", hh_ms_now(),
+            (unsigned long long)hh_get_vi_count(), r32(0x801D8CE8), r32(0x801D8CE8) + 1, r32(0x801D8CF0));
+    }
+    hh_real_M24_FUN_801bffac(rdram, ctx);
+}
+static recomp_func_t* hh_real_FUN_801C0B8C = nullptr;
+static void hh_wrap_FUN_801C0B8C(uint8_t* rdram, recomp_context* ctx) {
+    uint32_t a0 = (uint32_t)ctx->r4, a1 = (uint32_t)ctx->r5;
+    hh_real_FUN_801C0B8C(rdram, ctx);
+    if (getenv("HH_LSTTRACE") != nullptr) {
+        static unsigned long long n = 0;
+        if (n < 60 || (n % 300) == 0) {
+            fprintf(stderr, "[TL] t=%d vi=%llu EVQCHECK n=%llu a0=%08X a1=%08X -> %08X\n",
+                hh_ms_now(), (unsigned long long)hh_get_vi_count(), n, a0, a1, (unsigned)ctx->r2);
+        }
+        n++;
+    }
+}
+static recomp_func_t* hh_real_M24_FUN_801bff20 = nullptr;
+static void hh_wrap_M24_FUN_801bff20(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) fprintf(stderr, "[TL] t=%d vi=%llu PFF20\n",
+        hh_ms_now(), (unsigned long long)hh_get_vi_count());
+    hh_real_M24_FUN_801bff20(rdram, ctx);
+}
+// HH: cadena de decision del cambio de escena (M24_FUN_801bf398) y sus checks. En el port el flag
+// [0x801D8CFC] se pone a 1 en VI~790 (emulador: nunca durante la transicion) -> adelanta la carga de
+// modulos sobre el modulo 24. Aqui se registra que check pasa y cuando.
+static recomp_func_t* hh_real_M24_FUN_801bf398 = nullptr;
+static void hh_wrap_M24_FUN_801bf398(uint8_t* rdram, recomp_context* ctx) {
+    auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+    uint32_t f478_before = r32(0x80089478);
+    uint32_t before = r32(0x801D8CFC);
+    hh_real_M24_FUN_801bf398(rdram, ctx);
+    uint32_t f478_after = r32(0x80089478);
+    if (getenv("HH_LSTTRACE") != nullptr && f478_after != f478_before) {
+        fprintf(stderr, "[TL] t=%d vi=%llu F89478 %08X -> %08X (lhu=%04X b1000=%u cnt30=%u)\n",
+            hh_ms_now(), (unsigned long long)hh_get_vi_count(), f478_before, f478_after,
+            (f478_after >> 16) & 0xFFFFu, ((f478_after >> 16) & 0x1000u) != 0 ? 1u : 0u, r32(0x801D8DA8));
+    }
+    uint32_t after = r32(0x801D8CFC);
+    if (getenv("HH_LSTTRACE") != nullptr && after != before) {
+        fprintf(stderr, "[TL] t=%d vi=%llu FLAG 801D8CFC %u->%u tl=%08X f28=%08X cnt=%u ev=%08X\n",
+            hh_ms_now(), (unsigned long long)hh_get_vi_count(), before, after,
+            r32(0x801D8CE4), r32(0x801DE828), r32(0x801D8DA8), r32(0x801DE830));
+    }
+}
+static void hh_chain_log(int slot, const char* name, uint32_t v, uint8_t* rdram) {
+    static uint32_t last[8] = {0xEEEEEEEEu,0xEEEEEEEEu,0xEEEEEEEEu,0xEEEEEEEEu,0xEEEEEEEEu,0xEEEEEEEEu,0xEEEEEEEEu,0xEEEEEEEEu};
+    uint64_t vi = hh_get_vi_count();
+    bool window = (vi >= 780 && vi <= 835);
+    if (slot < 0 || slot > 7 || (!window && last[slot] == v)) return;
+    last[slot] = v;
+    auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+    fprintf(stderr, "[TL] t=%d vi=%llu CHAIN %s -> %08X (tl=%08X f28=%08X cnt=%u ev=%08X flag=%u f00=%08X)\n",
+        hh_ms_now(), (unsigned long long)vi, name, v,
+        r32(0x801D8CE4), r32(0x801DE828), r32(0x801D8DA8), r32(0x801DE830), r32(0x801D8CFC) & 0xFF, r32(0x801D8D00));
+}
+static recomp_func_t* hh_real_M24_FUN_801c02fc = nullptr;
+static void hh_wrap_M24_FUN_801c02fc(uint8_t* rdram, recomp_context* ctx) {
+    hh_real_M24_FUN_801c02fc(rdram, ctx);
+    if (getenv("HH_LSTTRACE") != nullptr) hh_chain_log(0, "CHK_02FC", (uint32_t)ctx->r2, rdram);
+}
+static recomp_func_t* hh_real_M24_FUN_801c0c68 = nullptr;
+static void hh_wrap_M24_FUN_801c0c68(uint8_t* rdram, recomp_context* ctx) {
+    hh_real_M24_FUN_801c0c68(rdram, ctx);
+    if (getenv("HH_LSTTRACE") != nullptr) hh_chain_log(1, "CHK_0C68", (uint32_t)ctx->r2, rdram);
+}
+static recomp_func_t* hh_real_M24_FUN_801c012c = nullptr;
+static void hh_wrap_M24_FUN_801c012c(uint8_t* rdram, recomp_context* ctx) {
+    hh_real_M24_FUN_801c012c(rdram, ctx);
+    if (getenv("HH_LSTTRACE") != nullptr) hh_chain_log(2, "CHK_012C", (uint32_t)ctx->r2, rdram);
+}
+static recomp_func_t* hh_real_M24_FUN_801c0190 = nullptr;
+static void hh_wrap_M24_FUN_801c0190(uint8_t* rdram, recomp_context* ctx) {
+    hh_real_M24_FUN_801c0190(rdram, ctx);
+    if (getenv("HH_LSTTRACE") != nullptr) hh_chain_log(3, "CHK_0190", (uint32_t)ctx->r2, rdram);
+}
+static recomp_func_t* hh_real_M24_FUN_801bf610 = nullptr;
+static void hh_wrap_M24_FUN_801bf610(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) fprintf(stderr, "[TL] t=%d vi=%llu SET_F28 a0=%08X\n",
+        hh_ms_now(), (unsigned long long)hh_get_vi_count(), (unsigned)ctx->r4);
+    hh_real_M24_FUN_801bf610(rdram, ctx);
+}
+static recomp_func_t* hh_real_M24_FUN_801bf61c = nullptr;
+static void hh_wrap_M24_FUN_801bf61c(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) fprintf(stderr, "[TL] t=%d vi=%llu SET_TL a0=%08X\n",
+        hh_ms_now(), (unsigned long long)hh_get_vi_count(), (unsigned)ctx->r4);
+    hh_real_M24_FUN_801bf61c(rdram, ctx);
+}
+static recomp_func_t* hh_real_FUN_80031190 = nullptr; // osGetTime (reimpl)
+static void hh_wrap_FUN_80031190(uint8_t* rdram, recomp_context* ctx) {
+    hh_real_FUN_80031190(rdram, ctx);
+    if (getenv("HH_LSTTRACE") != nullptr) {
+        static unsigned long long n = 0;
+        uint64_t vi = hh_get_vi_count();
+        if (vi < 1000 && (n % 500000) == 0) {
+            uint64_t t = ((uint64_t)(uint32_t)ctx->r2 << 32) | (uint32_t)ctx->r3;
+            fprintf(stderr, "[TL] t=%d vi=%llu OSGETTIME n=%llu v=%016llX (%llu ms)\n",
+                hh_ms_now(), (unsigned long long)vi, n,
+                (unsigned long long)t, (unsigned long long)(t / 46875));
+        }
+        n++;
+    }
+}
+// HH: camino de cambio de escena (modulo 99) invocado por M24_FUN_801bf398 cuando el predicado
+// FUN_801BFA58() != 0. En el emulador la carga de modulos ocurre en VI~3660; en el port en VI~840.
+static void hh_scenefn(const char* name, uint8_t* rdram, recomp_context* ctx) {
+    (void)rdram;
+    if (getenv("HH_LSTTRACE") != nullptr) {
+        fprintf(stderr, "[TL] t=%d vi=%llu SCENEFN %s a0=%08X a1=%08X a2=%08X a3=%08X\n",
+            hh_ms_now(), (unsigned long long)hh_get_vi_count(), name,
+            (unsigned)ctx->r4, (unsigned)ctx->r5, (unsigned)ctx->r6, (unsigned)ctx->r7);
+    }
+}
+static recomp_func_t* hh_real_FUN_8038BCE0 = nullptr;
+static void hh_wrap_FUN_8038BCE0(uint8_t* rdram, recomp_context* ctx) {
+    auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+    hh_scenefn("8038BCE0", rdram, ctx);
+    static uint32_t last478 = 0xEEEEEEEEu;
+    uint32_t a = r32(0x80089478);
+    if (getenv("HH_LSTTRACE") != nullptr && a != last478) {
+        fprintf(stderr, "[TL] t=%d vi=%llu P89478 %08X -> %08X (lhu=%04X b1000=%u cnt30=%u tl=%08X d00=%08X)\n",
+            hh_ms_now(), (unsigned long long)hh_get_vi_count(), last478, a,
+            (a >> 16) & 0xFFFFu, ((a >> 16) & 0x1000u) ? 1u : 0u, r32(0x801D8DA8),
+            r32(0x801D8CE4), r32(0x801D8D00));
+        last478 = a;
+    }
+    hh_real_FUN_8038BCE0(rdram, ctx);
+}
+static recomp_func_t* hh_real_FUN_8038C914 = nullptr;
+static void hh_wrap_FUN_8038C914(uint8_t* rdram, recomp_context* ctx) { hh_scenefn("8038C914", rdram, ctx); hh_real_FUN_8038C914(rdram, ctx); }
+static recomp_func_t* hh_real_FUN_8038CA8C = nullptr;
+static void hh_wrap_FUN_8038CA8C(uint8_t* rdram, recomp_context* ctx) { hh_scenefn("8038CA8C", rdram, ctx); hh_real_FUN_8038CA8C(rdram, ctx); }
+static recomp_func_t* hh_real_FUN_8038D224 = nullptr;
+static void hh_wrap_FUN_8038D224(uint8_t* rdram, recomp_context* ctx) { hh_scenefn("8038D224", rdram, ctx); hh_real_FUN_8038D224(rdram, ctx); }
+static recomp_func_t* hh_real_M24_FUN_801bfa58 = nullptr;
+static void hh_wrap_M24_FUN_801bfa58(uint8_t* rdram, recomp_context* ctx) {
+    hh_real_M24_FUN_801bfa58(rdram, ctx);
+    if (getenv("HH_LSTTRACE") != nullptr) {
+        static uint32_t last = 0xEEEEEEEEu;
+        uint32_t v = (uint32_t)ctx->r2;
+        if (v != last) {
+            auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+            fprintf(stderr, "[TL] t=%d vi=%llu BFA58 -> %08X (f28=%08X cnt30=%u tl=%08X g2=%u ctr=%u flag=%u)\n",
+                hh_ms_now(), (unsigned long long)hh_get_vi_count(), v, r32(0x801DE828),
+                r32(0x801D8DA8), r32(0x801D8CE4), r32(0x801D8CE8), r32(0x801D8CF0), r32(0x801D8CFC) & 0xFF);
+            last = v;
+        }
+    }
+}
+// HH: dispatcher de comandos de guion (M24_FUN_801bf850): a0=obj, a1=indice, a2=cmd.
+static recomp_func_t* hh_real_M24_FUN_801bf850 = nullptr;
+static void hh_wrap_M24_FUN_801bf850(uint8_t* rdram, recomp_context* ctx) {
+    uint32_t a0 = (uint32_t)ctx->r4, a1 = (uint32_t)ctx->r5, a2 = (uint32_t)ctx->r6;
+    hh_real_M24_FUN_801bf850(rdram, ctx);
+    if (getenv("HH_LSTTRACE") != nullptr) {
+        auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+        uint32_t cmd = r32(a2), word1 = r32(a2 + 4);
+        fprintf(stderr, "[TL] t=%d vi=%llu CMD a0=%08X idx=%u cmd=%08X w1=%08X -> %08X\n",
+            hh_ms_now(), (unsigned long long)hh_get_vi_count(), a0, a1, cmd, word1, (unsigned)ctx->r2);
+    }
+}
+static recomp_func_t* hh_real_M24_FUN_801c0464 = nullptr;
+static void hh_wrap_M24_FUN_801c0464(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) fprintf(stderr, "[LST] t=%d vi=%llu SCRIPT a0=%08X a1=%08X\n",
+        hh_ms_now(), (unsigned long long)hh_get_vi_count(), (unsigned)ctx->r4, (unsigned)ctx->r5);
+    hh_real_M24_FUN_801c0464(rdram, ctx);
+}
+static recomp_func_t* hh_real_M25_FUN_801e389c = nullptr;
+static void hh_wrap_M25_FUN_801e389c(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) fprintf(stderr, "[LST] t=%d vi=%llu M25C@389c a0=%08X a1=%08X\n",
+        hh_ms_now(), (unsigned long long)hh_get_vi_count(), (unsigned)ctx->r4, (unsigned)ctx->r5);
+    hh_real_M25_FUN_801e389c(rdram, ctx);
+}
+static recomp_func_t* hh_real_M25_FUN_801e39f8 = nullptr;
+static void hh_wrap_M25_FUN_801e39f8(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) fprintf(stderr, "[LST] t=%d vi=%llu M25C@39f8 a0=%08X a1=%08X\n",
+        hh_ms_now(), (unsigned long long)hh_get_vi_count(), (unsigned)ctx->r4, (unsigned)ctx->r5);
+    hh_real_M25_FUN_801e39f8(rdram, ctx);
+}
+static recomp_func_t* hh_real_FUN_8000433C = nullptr;
+static void hh_wrap_FUN_8000433C(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) {
+        auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+        uint32_t s[8];
+        bool any = false;
+        for (int i = 0; i < 8; ++i) { s[i] = r32(0x800894F4 + i * 4); if (s[i] != 0) any = true; }
+        if (any) {
+            fprintf(stderr, "[LST] t=%d PROC slots=", hh_ms_now());
+            for (int i = 0; i < 8; ++i) fprintf(stderr, "%08X%s", s[i], i == 7 ? "\n" : ",");
+        }
+    }
+    hh_real_FUN_8000433C(rdram, ctx);
 }
 static void hh_log_chain(const char* name, uint8_t* rdram, recomp_context* ctx) {
     fprintf(stderr, "[CHN] t=%d %s a0=%08X a1=%08X bd6d=%02X d550=%02X\n", hh_ms_now(), name,
@@ -849,14 +1242,15 @@ static void hh_wrap_FUN_80004560(uint8_t* rdram, recomp_context* ctx) {
     }
     n++;
 }
+extern "C" double hh_time_now(void);
 static recomp_func_t* hh_real_FUN_80000ed0 = nullptr; // submit de task con contador +0x89C
 static void hh_wrap_FUN_80000ed0(uint8_t* rdram, recomp_context* ctx) {
     auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
     uint32_t mq = (uint32_t)ctx->r5, msg = (uint32_t)ctx->r6;
     uint32_t before = r32(0x8005CD4C);
-    fprintf(stderr, "[SUBM] tid=%d msg=%08X mq=%08X fl8=%08X cnt=%u\n", hh_tid(rdram), msg, mq, r32((msg & 0x7FFFFF) + 8), before);
+    fprintf(stderr, "[SUBM] t=%.3f tid=%d msg=%08X mq=%08X fl8=%08X cnt=%u\n", hh_time_now(), hh_tid(rdram), msg, mq, r32((msg & 0x7FFFFF) + 8), before);
     hh_real_FUN_80000ed0(rdram, ctx);
-    fprintf(stderr, "[SUBM] -> cnt=%u\n", r32(0x8005CD4C));
+    fprintf(stderr, "[SUBM] -> t=%.3f cnt=%u\n", hh_time_now(), r32(0x8005CD4C));
 }
 
 // HH: declaraciones para el registro de llamadas (diagnostico de pila).
@@ -866,6 +1260,7 @@ extern "C" uint8_t* hh_get_rdram_base(void);
 extern "C" void hh_ring_record(uint32_t target, uint32_t sp);
 extern "C" void hh_ring2_record(uint32_t target, uint32_t sp);
 extern "C" void hh_callring_record(uint32_t addr);
+extern "C" void hh_trace_fn(uint32_t addr);
 extern "C" recomp_context* hh_get_current_ctx(void);
 extern "C" uint8_t* hh_get_rdram_base(void);
 
@@ -914,6 +1309,7 @@ static void hh_s0fix_check(uint32_t tgt, recomp_context* ctx) {
 extern "C" recomp_func_t * get_function(int32_t addr) {
     hh_calltrace((uint32_t)addr);
     hh_callring_record((uint32_t)addr);
+    hh_trace_fn((uint32_t)addr);
     // HH: vigila cambios de r16 (s0) entre llamadas guest. El cuelgue por dano: s0 se machaca a
     // 0x1E82 y el dispatch frame/no-op del bucle principal se rompe. Loguea SOLO los cambios con
     // la funcion anterior (la culpable) y la actual. Gated por HH_MQLOG_ALL -> hh_s0.log.
@@ -968,7 +1364,26 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         hh_ring_record((uint32_t)addr, hh_sp);
         hh_ring2_record((uint32_t)addr, hh_sp);
     }
+    const char* hh_mod_label = nullptr;
+    if (hh_modtrace_match((uint32_t)addr, &hh_mod_label)) {
+        recomp_context* hc_m = hh_get_current_ctx();
+        auto itm = func_map.find(addr);
+        uint16_t hh_mode = 0;
+        uint8_t* hh_rb = hh_get_rdram_base();
+        if (hh_rb != nullptr) hh_mode = *(uint16_t*)&hh_rb[(0x801BBC1C ^ 2) & 0x7FFFFF];
+        fprintf(stderr, "[MODT] %-10s vi=%llu mode=%04X addr=%08X ra=%08X -> %p\n", hh_mod_label,
+                (unsigned long long)hh_get_vi_count(), (unsigned)hh_mode, (unsigned)addr,
+                hc_m != nullptr ? (unsigned)hc_m->r31 : 0,
+                itm != func_map.end() ? (const void*)itm->second : nullptr);
+    }
     auto func_find = func_map.find(addr);
+    if (hh_owner_watched(addr)) {
+        recomp_context* hc_o = hh_get_current_ctx();
+        fprintf(stderr, "[OWNER] get addr=%08X ra=%08X ret=exe+0x%llX -> %p\n", addr,
+                hc_o != nullptr ? (unsigned)hc_o->r31 : 0,
+                (unsigned long long)HH_RETURN_RVA(),
+                func_find != func_map.end() ? (const void*)func_find->second : nullptr);
+    }
     if (func_find == func_map.end()) {
         // HH: diagnostico del LLAMANTE. Un target invalido (p. ej. 0xFF7F84CD) suele ser un puntero
         // de funcion corrupto, no un simbolo sin registrar. `ra` identifica al que intenta llamarlo.
@@ -1048,7 +1463,7 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         }
         return hh_wrap_FUN_80003824;
     }
-    if (getenv("HH_TBLTRACE") != nullptr) {
+    if (getenv("HH_TBLTRACE") != nullptr || getenv("HH_LSTTRACE") != nullptr) {
         switch ((uint32_t)addr) {
             case 0x80017064: if (hh_real_FUN_80017064 == nullptr) hh_real_FUN_80017064 = func_find->second; return hh_wrap_FUN_80017064;
             case 0x80017014: if (hh_real_FUN_80017014 == nullptr) hh_real_FUN_80017014 = func_find->second; return hh_wrap_FUN_80017014;
@@ -1077,6 +1492,32 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
             case 0x80035050: if (hh_real_FUN_80035050 == nullptr) hh_real_FUN_80035050 = func_find->second; return hh_wrap_FUN_80035050;
             case 0x800058DC: if (hh_real_FUN_800058dc == nullptr) hh_real_FUN_800058dc = func_find->second; return hh_wrap_FUN_800058dc;
             case 0x80003824: if (hh_real_FUN_80003824 == nullptr) hh_real_FUN_80003824 = func_find->second; return hh_wrap_FUN_80003824;
+            case 0x8000469C: if (hh_real_FUN_8000469c == nullptr) hh_real_FUN_8000469c = func_find->second; return hh_wrap_FUN_8000469c;
+            case 0x80004310: if (hh_real_FUN_80004310 == nullptr) hh_real_FUN_80004310 = func_find->second; return hh_wrap_FUN_80004310;
+            case 0x8000433C: if (hh_real_FUN_8000433C == nullptr) hh_real_FUN_8000433C = func_find->second; return hh_wrap_FUN_8000433C;
+            case 0x801BFAA0: if (hh_real_M24_FUN_801bfaa0 == nullptr) hh_real_M24_FUN_801bfaa0 = func_find->second; return hh_wrap_M24_FUN_801bfaa0;
+            case 0x801BFFAC: if (hh_real_M24_FUN_801bffac == nullptr) hh_real_M24_FUN_801bffac = func_find->second; return hh_wrap_M24_FUN_801bffac;
+            case 0x801C0B8C: if (hh_real_FUN_801C0B8C == nullptr) hh_real_FUN_801C0B8C = func_find->second; return hh_wrap_FUN_801C0B8C;
+            case 0x801BFF20: if (hh_real_M24_FUN_801bff20 == nullptr) hh_real_M24_FUN_801bff20 = func_find->second; return hh_wrap_M24_FUN_801bff20;
+            case 0x801BF398: if (hh_real_M24_FUN_801bf398 == nullptr) hh_real_M24_FUN_801bf398 = func_find->second; return hh_wrap_M24_FUN_801bf398;
+            case 0x801C02FC: if (hh_real_M24_FUN_801c02fc == nullptr) hh_real_M24_FUN_801c02fc = func_find->second; return hh_wrap_M24_FUN_801c02fc;
+            case 0x801C0C68: if (hh_real_M24_FUN_801c0c68 == nullptr) hh_real_M24_FUN_801c0c68 = func_find->second; return hh_wrap_M24_FUN_801c0c68;
+            case 0x801C012C: if (hh_real_M24_FUN_801c012c == nullptr) hh_real_M24_FUN_801c012c = func_find->second; return hh_wrap_M24_FUN_801c012c;
+            case 0x801C0190: if (hh_real_M24_FUN_801c0190 == nullptr) hh_real_M24_FUN_801c0190 = func_find->second; return hh_wrap_M24_FUN_801c0190;
+            case 0x801BF610: if (hh_real_M24_FUN_801bf610 == nullptr) hh_real_M24_FUN_801bf610 = func_find->second; return hh_wrap_M24_FUN_801bf610;
+            case 0x801BF61C: if (hh_real_M24_FUN_801bf61c == nullptr) hh_real_M24_FUN_801bf61c = func_find->second; return hh_wrap_M24_FUN_801bf61c;
+            case 0x80031190: if (hh_real_FUN_80031190 == nullptr) hh_real_FUN_80031190 = func_find->second; return hh_wrap_FUN_80031190;
+            case 0x801C0464: if (hh_real_M24_FUN_801c0464 == nullptr) hh_real_M24_FUN_801c0464 = func_find->second; return hh_wrap_M24_FUN_801c0464;
+            case 0x801BF850: if (hh_real_M24_FUN_801bf850 == nullptr) hh_real_M24_FUN_801bf850 = func_find->second; return hh_wrap_M24_FUN_801bf850;
+            case 0x801BFA58: if (hh_real_M24_FUN_801bfa58 == nullptr) hh_real_M24_FUN_801bfa58 = func_find->second; return hh_wrap_M24_FUN_801bfa58;
+            case 0x8038BCE0: if (hh_real_FUN_8038BCE0 == nullptr) hh_real_FUN_8038BCE0 = func_find->second; return hh_wrap_FUN_8038BCE0;
+            case 0x8038C914: if (hh_real_FUN_8038C914 == nullptr) hh_real_FUN_8038C914 = func_find->second; return hh_wrap_FUN_8038C914;
+            case 0x8038CA8C: if (hh_real_FUN_8038CA8C == nullptr) hh_real_FUN_8038CA8C = func_find->second; return hh_wrap_FUN_8038CA8C;
+            case 0x8038D224: if (hh_real_FUN_8038D224 == nullptr) hh_real_FUN_8038D224 = func_find->second; return hh_wrap_FUN_8038D224;
+            case 0x801C2420: if (hh_real_M24_FUN_801c2420 == nullptr) hh_real_M24_FUN_801c2420 = func_find->second; return hh_wrap_M24_FUN_801c2420;
+            case 0x801C242C: if (hh_real_M24_FUN_801c242c == nullptr) hh_real_M24_FUN_801c242c = func_find->second; return hh_wrap_M24_FUN_801c242c;
+            case 0x801E389C: if (hh_real_M25_FUN_801e389c == nullptr) hh_real_M25_FUN_801e389c = func_find->second; return hh_wrap_M25_FUN_801e389c;
+            case 0x801E39F8: if (hh_real_M25_FUN_801e39f8 == nullptr) hh_real_M25_FUN_801e39f8 = func_find->second; return hh_wrap_M25_FUN_801e39f8;
             case 0x80005270: if (hh_real_FUN_80005270 == nullptr) hh_real_FUN_80005270 = func_find->second; return hh_wrap_FUN_80005270;
             case 0x801CBE88: if (hh_real_FUN_801CBE88 == nullptr) hh_real_FUN_801CBE88 = func_find->second; return hh_wrap_FUN_801CBE88;
             case 0x801CBDC0: if (hh_real_FUN_801CBDC0 == nullptr) hh_real_FUN_801CBDC0 = func_find->second; return hh_wrap_FUN_801CBDC0;

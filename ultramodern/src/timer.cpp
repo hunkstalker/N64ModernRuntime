@@ -15,6 +15,18 @@
 static std::chrono::high_resolution_clock::time_point start_time = std::chrono::high_resolution_clock::now();
 // Offset of the duration since program start used to calculate the value for osGetTime. 
 static int64_t ostime_offset = 0;
+// HH: reloj de juego esclavo del replay (HH_REPLAY_CLOCK=1, lo activa el port desde input.cpp).
+// Con el replay activo, el tiempo de juego sigue la marca temporal de la muestra grabada en vez del
+// reloj de pared, para que los waits dependientes de tiempo consuman los mismos frames que en la
+// grabacion (fidelidad del diferencial port<->emulador). Ver notes/2026-09-17-cac-timeline-modulo24-periodo.md.
+static bool hh_replay_clock_active = false;
+static int64_t hh_replay_time = 0;      // valor fijado en la ultima muestra
+static int64_t hh_replay_base = 0;
+static double hh_replay_t0 = 0.0;
+static uint64_t hh_replay_wall = 0;     // time_now() de la ultima muestra
+static double hh_replay_t_set = 0.0;    // t de la ultima muestra
+static double hh_replay_rate = 1.0;     // segundos de grabacion por segundo de pared
+static constexpr int64_t hh_ticks_per_sec = 46'875'000; // counter_per_ms * 1000
 // Game speed multiplier (1 means no speedup)
 constexpr uint32_t speed_multiplier = 1;
 // N64 CPU counter ticks per millisecond
@@ -64,6 +76,42 @@ std::chrono::high_resolution_clock::time_point ticks_to_timepoint(uint64_t ticks
 
 uint64_t time_now() {
     return duration_to_ticks(std::chrono::high_resolution_clock::now() - start_time);
+}
+
+extern "C" void hh_replay_clock_set(double t_seconds) {
+    uint64_t wall = time_now();
+    if (!hh_replay_clock_active) {
+        hh_replay_clock_active = true;
+        hh_replay_base = (int64_t)wall - ostime_offset;
+        hh_replay_t0 = t_seconds;
+        hh_replay_rate = 1.0;
+    } else {
+        // Tasa local (segundos de grabacion / segundo de pared) para interpolar dentro del frame y
+        // evitar busy-waits congelados (el reloj solo avanzaba al aplicar muestra).
+        double wall_dt = (double)(wall - hh_replay_wall) / (double)hh_ticks_per_sec;
+        double rec_dt = t_seconds - hh_replay_t_set;
+        if (wall_dt > 1e-4 && rec_dt > 0.0) {
+            hh_replay_rate = rec_dt / wall_dt;
+            if (hh_replay_rate > 2.0) hh_replay_rate = 2.0;
+            if (hh_replay_rate < 0.05) hh_replay_rate = 0.05;
+        }
+    }
+    hh_replay_time = hh_replay_base + (int64_t)((t_seconds - hh_replay_t0) * (double)hh_ticks_per_sec);
+    hh_replay_wall = wall;
+    hh_replay_t_set = t_seconds;
+}
+
+extern "C" bool hh_replay_clock_on() {
+    return hh_replay_clock_active;
+}
+
+// HH: indice de muestra del replay aplicada (para correlacionar eventos con la grabacion).
+static uint64_t hh_replay_sample = 0;
+extern "C" void hh_replay_set_sample(uint64_t idx) {
+    hh_replay_sample = idx;
+}
+extern "C" uint64_t hh_replay_get_sample() {
+    return hh_replay_sample;
 }
 
 void timer_thread(RDRAM_ARG1) {
@@ -159,6 +207,11 @@ std::chrono::high_resolution_clock::duration ultramodern::time_since_start() {
 }
 
 extern "C" u32 osGetCount() {
+    if (hh_replay_clock_active) {
+        uint64_t wall = time_now();
+        int64_t extra = (int64_t)((double)(wall - hh_replay_wall) * hh_replay_rate);
+        return (uint32_t)(hh_replay_time + extra);
+    }
     uint64_t total_count = time_now();
 
     // Allow for overflows, which is how osGetCount behaves
@@ -170,12 +223,24 @@ extern "C" void osSetCount(u32 count) {
 }
 
 extern "C" OSTime osGetTime() {
+    if (hh_replay_clock_active) {
+        // HH: valor fijado por la muestra + interpolacion intra-frame a la tasa de la grabacion.
+        uint64_t wall = time_now();
+        int64_t extra = (int64_t)((double)(wall - hh_replay_wall) * hh_replay_rate);
+        return (OSTime)(hh_replay_time + extra);
+    }
     uint64_t total_count = time_now() - ostime_offset;
 
     return total_count;
 }
 
 extern "C" void osSetTime(OSTime t) {
+    if (hh_replay_clock_active) {
+        // HH: con el reloj de replay activo, osSetTime reajusta la base para no perder la referencia.
+        hh_replay_base += ((int64_t)t - hh_replay_time);
+        hh_replay_time = (int64_t)t;
+        return;
+    }
     ostime_offset = time_now() - t;
 }
 

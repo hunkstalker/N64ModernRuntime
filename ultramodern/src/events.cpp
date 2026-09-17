@@ -163,6 +163,11 @@ extern uint64_t total_vis;
 // HH: base de RDRAM para diagnosticos fuera de este TU (p. ej. el dispatch del bucle principal).
 extern "C" uint8_t* hh_get_rdram_base(void) { return events_context.rdram; }
 
+extern "C" double hh_time_now(void);
+
+// HH: canary de corrupcion (definido en recomp.cpp).
+extern "C" void hh_canary_tick(void);
+
 extern "C" void hh_evt_log(const char* what, int event_id, PTR(OSMesgQueue) mq_, OSMesg msg, unsigned long long vi, int tid) {
     if (getenv("HH_MQLOG_ALL") == nullptr) return;
     static FILE* f = nullptr;
@@ -298,6 +303,12 @@ void vi_thread_func() {
         }
         total_vis = new_total_vis;
 
+        // HH: canary de corrupcion (ver recomp.cpp). Compara las regiones de HH_CANARY una vez
+        // por frame y loguea cualquier cambio que no haya pasado por los MEM_*.
+        if (ultramodern::is_game_started()) {
+            hh_canary_tick();
+        }
+
         // If the game hasn't started yet, set a dummy VI mode and origin.
         if (!ultramodern::is_game_started()) {
             static bool odd = false;
@@ -375,7 +386,7 @@ void vi_thread_func() {
                     static uint32_t prev_cd4c = 0;
                     static bool cd4c_init = false;
                     if (!cd4c_init || c != prev_cd4c) {
-                        fprintf(stderr, "[GATE] vis=%llu cd4c=%u\n", (unsigned long long)total_vis, c);
+                        fprintf(stderr, "[GATE] t=%.3f vis=%llu cd4c=%u\n", hh_time_now(), (unsigned long long)total_vis, c);
                         prev_cd4c = c;
                         cd4c_init = true;
                     }

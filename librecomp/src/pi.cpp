@@ -273,10 +273,12 @@ void ultramodern::join_saving_thread() {
     }
 }
 
-// HH: log siempre-activo del camino PI (hh_pi.log, acotado) para diagnosticar cuelgues tipo
-// "el juego espera una completacion de DMA que no llega". Cada linea lleva t= (segundos desde el
-// primer DMA) para poder alinear con hh_state.log. Limite: HH_PI_MAX bytes (defecto 32 MB).
+// HH: log del camino PI (hh_pi.log, acotado) para diagnosticar cuelgues tipo "el juego espera una
+// completacion de DMA que no llega". Cada linea lleva t= (segundos desde el primer DMA) para poder
+// alinear con hh_state.log. Limite: HH_PI_MAX bytes (defecto 32 MB). Gated por HH_DIAG=1.
+extern "C" int hh_diag_enabled(void);
 static void hh_pi_log(const char* fmt, ...) {
+    if (!hh_diag_enabled()) return;
     static FILE* f = nullptr;
     static long total = 0;
     static long max_total = -1;
