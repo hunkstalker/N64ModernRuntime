@@ -563,12 +563,18 @@ static void soft_missing_func(uint8_t*, recomp_context*) {}
 static FILE* hh_calltrace_fp = nullptr;
 static unsigned long hh_calltrace_n = 0;
 static void hh_calltrace(uint32_t a) {
-    if (hh_calltrace_fp == nullptr) {
+    // HH: cachear el flag (getenv en cada llamada recompilada era overhead masivo).
+    static int state = -1;  // -1 sin init, 0 off, 1 on
+    if (state < 0) {
         const char* e = getenv("HH_CALLTRACE");
-        if (e == nullptr || *e == 0) return;
-        hh_calltrace_fp = fopen(e, "wb");
-        if (hh_calltrace_fp == nullptr) return;
+        if (e == nullptr || *e == 0) {
+            state = 0;
+        } else {
+            hh_calltrace_fp = fopen(e, "wb");
+            state = (hh_calltrace_fp != nullptr) ? 1 : 0;
+        }
     }
+    if (state != 1) return;
     fwrite(&a, 4, 1, hh_calltrace_fp);
     if ((++hh_calltrace_n & 0xFFF) == 0) fflush(hh_calltrace_fp);
 }
@@ -1307,13 +1313,19 @@ static void hh_s0fix_check(uint32_t tgt, recomp_context* ctx) {
 }
 
 extern "C" recomp_func_t * get_function(int32_t addr) {
+    // HH: flags de instrumentacion CACHEADOS. getenv() es caro y get_function se ejecuta en CADA
+    // llamada recompilada (millones por tick en bucles de decodificacion como 0x80015A64/0x80016xxx)
+    // -> cachearlos evita segundos de overhead. Se evaluan una sola vez.
+    static const bool hh_mqlog_on = getenv("HH_MQLOG_ALL") != nullptr;
+    static const bool hh_tbltrace_on = getenv("HH_TBLTRACE") != nullptr || getenv("HH_LSTTRACE") != nullptr;
+    static const bool hh_modtrace_on = getenv("HH_MODTRACE") != nullptr;
     hh_calltrace((uint32_t)addr);
     hh_callring_record((uint32_t)addr);
     hh_trace_fn((uint32_t)addr);
     // HH: vigila cambios de r16 (s0) entre llamadas guest. El cuelgue por dano: s0 se machaca a
     // 0x1E82 y el dispatch frame/no-op del bucle principal se rompe. Loguea SOLO los cambios con
     // la funcion anterior (la culpable) y la actual. Gated por HH_MQLOG_ALL -> hh_s0.log.
-    if (getenv("HH_MQLOG_ALL") != nullptr) {
+    if (hh_mqlog_on) {
         recomp_context* hc0 = hh_get_current_ctx();
         if (hc0 != nullptr) {
             uint32_t r16 = (uint32_t)hc0->r16;
@@ -1342,7 +1354,7 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         hh_s0fix_check((uint32_t)addr, hc_fix);
     }
     if (((uint32_t)addr == 0x80001454u || (uint32_t)addr == 0x80001BB0u ||
-         (uint32_t)addr == 0x8000290Cu || (uint32_t)addr == 0x800266B0u) && getenv("HH_MQLOG_ALL") != nullptr) {
+         (uint32_t)addr == 0x8000290Cu || (uint32_t)addr == 0x800266B0u) && hh_mqlog_on) {
         recomp_context* hc = hh_get_current_ctx();
         uint32_t s0 = hc != nullptr ? (uint32_t)hc->r16 : 0;
         uint32_t flag = 0;
@@ -1365,7 +1377,7 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         hh_ring2_record((uint32_t)addr, hh_sp);
     }
     const char* hh_mod_label = nullptr;
-    if (hh_modtrace_match((uint32_t)addr, &hh_mod_label)) {
+    if (hh_modtrace_on && hh_modtrace_match((uint32_t)addr, &hh_mod_label)) {
         recomp_context* hc_m = hh_get_current_ctx();
         auto itm = func_map.find(addr);
         uint16_t hh_mode = 0;
@@ -1463,7 +1475,7 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         }
         return hh_wrap_FUN_80003824;
     }
-    if (getenv("HH_TBLTRACE") != nullptr || getenv("HH_LSTTRACE") != nullptr) {
+    if (hh_tbltrace_on) {
         switch ((uint32_t)addr) {
             case 0x80017064: if (hh_real_FUN_80017064 == nullptr) hh_real_FUN_80017064 = func_find->second; return hh_wrap_FUN_80017064;
             case 0x80017014: if (hh_real_FUN_80017014 == nullptr) hh_real_FUN_80017014 = func_find->second; return hh_wrap_FUN_80017014;
