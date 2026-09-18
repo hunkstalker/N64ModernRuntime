@@ -814,16 +814,18 @@ static void hh_watch_log(const char* what, uint64_t off, uint32_t extra) {
 }
 
 // HH: ring buffer de las ultimas llamadas (target + sp) para volcar la secuencia que hunde la pila.
+// Contadores uint64_t: get_function se llama ~43M/s; un `int` desborda en ~50s y `% 96` con un
+// negativo indexa fuera del array (SEGV en hh_ring2_record+0x51, visto 2026-09-18 con watchpoint).
 struct HhCallRec { uint32_t target; uint32_t sp; };
 static thread_local HhCallRec hh_ring[96];
-static thread_local int hh_ring_n = 0;
+static thread_local uint64_t hh_ring_n = 0;
 extern "C" void hh_ring_record(uint32_t target, uint32_t sp) {
     hh_ring[hh_ring_n % 96] = { target, sp };
     hh_ring_n++;
 }
 extern "C" void hh_ring_dump(FILE* f) {
-    int start = hh_ring_n > 96 ? hh_ring_n - 96 : 0;
-    for (int i = start; i < hh_ring_n; i++) {
+    uint64_t start = hh_ring_n > 96 ? hh_ring_n - 96 : 0;
+    for (uint64_t i = start; i < hh_ring_n; i++) {
         const HhCallRec& r = hh_ring[i % 96];
         fprintf(f, "   call -> 0x%08X sp=%08X\n", r.target, r.sp);
     }
@@ -832,16 +834,18 @@ extern "C" void hh_ring_dump(FILE* f) {
 // HH: ring grande (por hilo) de llamadas para capturar un frame entero y localizar la fuga de pila.
 static const int HH_RING2_SIZE = 1 << 16;
 static thread_local HhCallRec hh_ring2[HH_RING2_SIZE];
-static thread_local int hh_ring2_n = 0;
+static thread_local uint64_t hh_ring2_n = 0;
 extern "C" void hh_ring2_record(uint32_t target, uint32_t sp) {
     hh_ring2[hh_ring2_n % HH_RING2_SIZE] = { target, sp };
     hh_ring2_n++;
 }
-extern "C" int hh_ring2_count() { return hh_ring2_n; }extern "C" void hh_ring2_dump_last(FILE* f, int count) {
-    if (count > hh_ring2_n) count = hh_ring2_n;
+extern "C" int hh_ring2_count() { return (int)(hh_ring2_n % HH_RING2_SIZE); }
+extern "C" void hh_ring2_dump_last(FILE* f, int count) {
+    if (count < 0) count = 0;
+    if ((uint64_t)count > hh_ring2_n) count = (int)(hh_ring2_n % HH_RING2_SIZE);
     if (count > HH_RING2_SIZE) count = HH_RING2_SIZE;
-    int start = hh_ring2_n - count;
-    for (int i = start; i < hh_ring2_n; i++) {
+    uint64_t start = hh_ring2_n - (uint64_t)count;
+    for (uint64_t i = start; i < hh_ring2_n; i++) {
         const HhCallRec& r = hh_ring2[i % HH_RING2_SIZE];
         fprintf(f, "0x%08X %08X\n", r.target, r.sp);
     }
