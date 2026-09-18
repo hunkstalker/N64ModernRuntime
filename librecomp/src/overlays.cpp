@@ -719,6 +719,10 @@ static void hh_wrap_FUN_8000469c(uint8_t* rdram, recomp_context* ctx) {
     }
 }
 static recomp_func_t* hh_real_FUN_80003824 = nullptr;
+// Fase B (ADR 0007): cache de assets + loader LZKN64 nativo (implementado en el port,
+// src/game/trans_cache.cpp). El wrapper cede el control a hh_trans_load, que decide entre cache,
+// nativo o loader original.
+extern "C" void hh_trans_load(uint8_t* rdram, recomp_context* ctx, recomp_func_t* real_loader);
 static void hh_wrap_FUN_80003824(uint8_t* rdram, recomp_context* ctx) {
     uint32_t src = (uint32_t)ctx->r4;
     uint32_t dst = (uint32_t)ctx->r5;
@@ -727,7 +731,7 @@ static void hh_wrap_FUN_80003824(uint8_t* rdram, recomp_context* ctx) {
                 src, dst, (unsigned)ctx->r6, (unsigned)ctx->r7,
                 (unsigned long long)hh_replay_get_sample());
     }
-    hh_real_FUN_80003824(rdram, ctx);
+    hh_trans_load(rdram, ctx, hh_real_FUN_80003824);
     // HH: tras la descompresion, el byte en 0x801CC8C4 (offset 0xD724 de la base 0x801BF1A0) dice
     // si el "estado" del selector es DATO del modulo cargado.
     if (getenv("HH_TBLTRACE") != nullptr) {
