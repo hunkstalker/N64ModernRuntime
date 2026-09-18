@@ -791,9 +791,45 @@ static void hh_watch_log(const char* what, uint64_t off, uint32_t extra) {
     // HH: valor ACTUAL en esa direccion (antes del acceso). Al cambiar a basura, la entrada justo
     // anterior en el log identifica quien la escribio.
     uint32_t val = 0;
-    if (uint8_t* rb = hh_get_rdram_base()) {
+    uint8_t* rb = hh_get_rdram_base();
+    if (rb != nullptr) {
         unsigned int o = (unsigned int)off & 0x1FFFFFFFu;
         if (o + 4 <= 0x40000000u) val = *(uint32_t*)(rb + o);
+    }
+    // HH: cuando el watchpoint ve el veneno 0xFFFF84CD/0xFF7F84CD, volcar la PILA GUEST completa
+    // (cadena de retornos: revela quien llama a FUN_800058dc) y el anillo de llamadas. Gated por
+    // HH_WATCH_VENOM=1 para no ensuciar. Ver notes/2026-09-18-diferencial-*.md.
+    if (getenv("HH_WATCH_VENOM") != nullptr && rb != nullptr && c != nullptr &&
+        (a1 == 0xFFFF84CDu || a1 == 0xFF7F84CDu)) {
+        static FILE* vf = nullptr;
+        static int vn = 0;
+        if (vf == nullptr) vf = fopen("hh_venom.log", "w");
+        if (vf != nullptr && vn < 8) {
+            vn++;
+            uint32_t sp = (uint32_t)c->r29;
+            fprintf(vf, "=== VENOM #%d t=%.3f off=%05llX val(prev)=%08X a0=%08X a1=%08X a2=%08X a3=%08X sp=%08X ===\n",
+                    vn, t, (unsigned long long)off, val, a0, a1, a2, a3, sp);
+            // Pila guest: palabras que parecen direcciones de codigo (RA guardadas) en [sp, sp+0x400).
+            fprintf(vf, "  stack-RA:");
+            int cnt = 0;
+            for (uint32_t a = sp; a < sp + 0x400u && a + 4 <= 0x80800000u; a += 4) {
+                uint32_t v = *(uint32_t*)(rb + (a - 0x80000000u));
+                if (v >= 0x80000400u && v < 0x80800000u) {
+                    if ((cnt % 5) == 0) fprintf(vf, "\n    +%03X:", a - sp);
+                    fprintf(vf, " %08X", v);
+                    if (++cnt >= 40) break;
+                }
+            }
+            fprintf(vf, "\n");
+            uint32_t ring[16];
+            int rn = hh_get_callring(c, ring, 16);
+            if (rn > 0) {
+                fprintf(vf, "  callring:");
+                for (int k = 0; k < rn; k++) fprintf(vf, " %08X", ring[k]);
+                fprintf(vf, "\n");
+            }
+            fflush(vf);
+        }
     }
     fprintf(f, "[WATCH] t=%.3f %s off=%05llX val=%08X ra=%08X sp=%08X a0=%08X a1=%08X a2=%08X a3=%08X extra=%08X ret=%p (exe+0x%llX)\n",
             t, what, (unsigned long long)off, val, ra, sp, a0, a1, a2, a3, extra, ret, ret_off);

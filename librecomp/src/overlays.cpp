@@ -742,9 +742,45 @@ static void hh_wrap_FUN_80003824(uint8_t* rdram, recomp_context* ctx) {
 }
 // HH: cadena del nodo de boot: setter de callback (FUN_800058DC), dispatcher y pasos del
 // módulo 23 que deben avanzar 0x801CFE00/02.
+extern "C" int hh_get_callring(recomp_context* c, uint32_t* out, int max);
 static recomp_func_t* hh_real_FUN_800058dc = nullptr;
 static void hh_wrap_FUN_800058dc(uint8_t* rdram, recomp_context* ctx) {
-    fprintf(stderr, "[SETCB] obj=%08X cb=%08X\n", (unsigned)ctx->r4, (unsigned)ctx->r5);
+    if (getenv("HH_TBLTRACE") != nullptr) {
+        fprintf(stderr, "[SETCB] obj=%08X cb=%08X\n", (unsigned)ctx->r4, (unsigned)ctx->r5);
+    }
+    // HH: al ver el veneno, volcar la PILA GUEST (cadena de retornos) y el anillo de llamadas.
+    // Es la via barata (solo el setter, ~1400 llamadas) para localizar quien dispara el disable.
+    if (ctx->r5 == 0xFFFF84CDu || ctx->r5 == 0xFF7F84CDu) {
+        static FILE* vf = nullptr;
+        static int vn = 0;
+        if (vf == nullptr) vf = fopen("hh_venom.log", "w");
+        if (vf != nullptr && vn < 12) {
+            vn++;
+            uint32_t sp = (uint32_t)ctx->r29;
+            uint32_t a0 = (uint32_t)ctx->r4, a2 = (uint32_t)ctx->r6, a3 = (uint32_t)ctx->r7;
+            fprintf(vf, "=== VENOM #%d obj=%08X cb=%08X a2=%08X a3=%08X ra=%08X sp=%08X ===\n",
+                    vn, a0, (uint32_t)ctx->r5, a2, a3, (uint32_t)ctx->r31, sp);
+            fprintf(vf, "  stack-RA:");
+            int cnt = 0;
+            for (uint32_t a = sp; a < sp + 0x600u && a + 4 <= 0x80800000u; a += 4) {
+                uint32_t v = *(uint32_t*)(rdram + (a - 0x80000000u));
+                if (v >= 0x80000400u && v < 0x80800000u) {
+                    if ((cnt % 5) == 0) fprintf(vf, "\n    +%03X:", a - sp);
+                    fprintf(vf, " %08X", v);
+                    if (++cnt >= 60) break;
+                }
+            }
+            fprintf(vf, "\n");
+            uint32_t ring[16];
+            int rn = hh_get_callring(ctx, ring, 16);
+            if (rn > 0) {
+                fprintf(vf, "  callring:");
+                for (int k = 0; k < rn; k++) fprintf(vf, " %08X", ring[k]);
+                fprintf(vf, "\n");
+            }
+            fflush(vf);
+        }
+    }
     hh_real_FUN_800058dc(rdram, ctx);
 }
 static recomp_func_t* hh_real_FUN_80005270 = nullptr;
@@ -1478,6 +1514,14 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
             hh_real_FUN_80003824 = func_find->second;
         }
         return hh_wrap_FUN_80003824;
+    }
+    // HH: el setter de callback FUN_800058dc se engancha SIEMPRE (barato: ~1400 llamadas). Si recibe
+    // el veneno 0xFFFF84CD, vuelca la pila guest (quien dispara el disable) a hh_venom.log.
+    if ((uint32_t)addr == 0x800058DC) {
+        if (hh_real_FUN_800058dc == nullptr) {
+            hh_real_FUN_800058dc = func_find->second;
+        }
+        return hh_wrap_FUN_800058dc;
     }
     if (hh_tbltrace_on) {
         switch ((uint32_t)addr) {
