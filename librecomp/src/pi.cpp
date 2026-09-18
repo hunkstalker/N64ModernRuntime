@@ -69,15 +69,25 @@ extern "C" void osCreatePiManager_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 void recomp::do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr, size_t num_bytes) {
-    // TODO use word copies when possible
-
     // TODO handle misaligned DMA
     assert((physical_addr & 0x1) == 0 && "Only PI DMA from aligned ROM addresses is currently supported");
     assert((ram_address & 0x7) == 0 && "Only PI DMA to aligned RDRAM addresses is currently supported");
     uint8_t* rom_addr = rom.data() + physical_addr - recomp::rom_base;
-    for (size_t i = 0; i < num_bytes; i++) {
-        MEM_B(i, ram_address) = *rom_addr;
-        rom_addr++;
+    // HH: copia en bloque. El bucle byte a byte con MEM_B (offset XOR 3 por cada byte) dominaba los
+    // hitches de carga/puerta: el loader lee modulos de cientos de KB. El layout de RDRAM del port
+    // es "word-swapped" (los 4 bytes de cada palabra guest invertidos), asi que una palabra ROM se
+    // vuelca con los bytes invertidos -> bswap32 por palabra + memcpy.
+    size_t i = 0;
+    if (((physical_addr | (uint32_t)ram_address) & 3u) == 0u) {
+        for (; i + 4 <= num_bytes; i += 4) {
+            uint32_t v;
+            memcpy(&v, rom_addr + i, 4);
+            v = (v >> 24) | ((v >> 8) & 0x0000FF00u) | ((v << 8) & 0x00FF0000u) | (v << 24);
+            memcpy(rdram + MEM_OFF(ram_address + i), &v, 4);
+        }
+    }
+    for (; i < num_bytes; i++) {
+        MEM_B(i, ram_address) = rom_addr[i];
     }
 }
 
