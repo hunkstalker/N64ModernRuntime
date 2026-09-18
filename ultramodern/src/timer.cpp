@@ -28,6 +28,11 @@ static uint64_t hh_replay_wall = 0;     // time_now() de la ultima muestra
 static double hh_replay_t_set = 0.0;    // t de la ultima muestra
 static double hh_replay_rate = 1.0;     // segundos de grabacion por segundo de pared
 static constexpr int64_t hh_ticks_per_sec = 46'875'000; // counter_per_ms * 1000
+// HH: interpolacion DETERMINISTA del reloj de replay: en vez de avanzar con tiempo de pared real
+// (que hacia el replay no reproducible), avanza por VI (como el N64). 60 VI/s.
+extern "C" uint64_t hh_get_vi_count(void);
+static uint64_t hh_replay_vi0 = 0;      // VI al aplicar la ultima muestra
+static constexpr int64_t hh_counter_per_vi = (int64_t)46'875 * 1000 / 60; // 781250
 // Game speed multiplier (1 means no speedup)
 constexpr uint32_t speed_multiplier = 1;
 // N64 CPU counter ticks per millisecond
@@ -112,6 +117,7 @@ extern "C" void hh_replay_clock_set(double t_seconds) {
     hh_replay_time = hh_replay_base + (int64_t)((t_seconds - hh_replay_t0) * (double)hh_ticks_per_sec);
     hh_replay_wall = wall;
     hh_replay_t_set = t_seconds;
+    hh_replay_vi0 = hh_get_vi_count();
 }
 
 extern "C" bool hh_replay_clock_on() {
@@ -221,8 +227,8 @@ std::chrono::high_resolution_clock::duration ultramodern::time_since_start() {
 
 extern "C" u32 osGetCount() {
     if (hh_replay_clock_active) {
-        uint64_t wall = time_now();
-        int64_t extra = (int64_t)((double)(wall - hh_replay_wall) * hh_replay_rate);
+        // HH: interpolacion determinista por VI (no tiempo de pared).
+        int64_t extra = (int64_t)(hh_get_vi_count() - hh_replay_vi0) * hh_counter_per_vi;
         return (uint32_t)(hh_replay_time + extra);
     }
     uint64_t total_count = time_now();
@@ -237,9 +243,9 @@ extern "C" void osSetCount(u32 count) {
 
 extern "C" OSTime osGetTime() {
     if (hh_replay_clock_active) {
-        // HH: valor fijado por la muestra + interpolacion intra-frame a la tasa de la grabacion.
-        uint64_t wall = time_now();
-        int64_t extra = (int64_t)((double)(wall - hh_replay_wall) * hh_replay_rate);
+        // HH: valor de la muestra + interpolacion DETERMINISTA por VI (no tiempo de pared real),
+        // para que el replay sea reproducible (los waits por osGetTime consumen los mismos VI).
+        int64_t extra = (int64_t)(hh_get_vi_count() - hh_replay_vi0) * hh_counter_per_vi;
         return (OSTime)(hh_replay_time + extra);
     }
     uint64_t total_count = time_now() - ostime_offset;
