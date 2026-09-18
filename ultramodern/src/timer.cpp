@@ -1,6 +1,7 @@
 #include <thread>
 #include <variant>
 #include <set>
+#include <cstdlib>
 #include "blockingconcurrentqueue.h"
 
 #include "ultramodern/ultra64.h"
@@ -75,7 +76,19 @@ std::chrono::high_resolution_clock::time_point ticks_to_timepoint(uint64_t ticks
 }
 
 uint64_t time_now() {
-    return duration_to_ticks(std::chrono::high_resolution_clock::now() - start_time);
+    // HH: HH_TIMESCALE=<f> escala el reloj del juego (para el replay frame-indexado: con el port a
+    // ~28,9 fps, un factor ~0,963 hace que el tiempo interno por frame sea 1/30 s, como el original,
+    // y los waits por tiempo consuman el mismo numero de frames; el limitador del juego sigue
+    // mandando sobre la velocidad de pared). Ver notes/2026-09-17-bizhawk-replay-freeze-con-rafaga.md.
+    static const double hh_scale = [] {
+        const char* ts = getenv("HH_TIMESCALE");
+        if (ts == nullptr || *ts == '\0') return 1.0;
+        double f = atof(ts);
+        return (f > 0.1 && f < 10.0) ? f : 1.0;
+    }();
+    uint64_t t = duration_to_ticks(std::chrono::high_resolution_clock::now() - start_time);
+    if (hh_scale == 1.0) return t;
+    return (uint64_t)((double)t * hh_scale);
 }
 
 extern "C" void hh_replay_clock_set(double t_seconds) {

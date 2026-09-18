@@ -270,6 +270,23 @@ extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
 
 void set_dummy_vi(bool odd);
 
+// HH: indice de muestra del replay aplicada (runtime ultramodern/src/timer.cpp).
+extern "C" uint64_t hh_replay_get_sample(void);
+// HH: FIFO fiel del AI (runtime ultramodern/src/audio.cpp). Devuelve 1 si hay que entregar el
+// evento AI (buffer completado). Sin HH_AI_FIFO=1 devuelve 1 siempre (evento cada VI).
+extern "C" int hh_ai_fifo_poll(void);
+
+// HH: tiempos del ultimo trabajo del hilo de gfx (para el diagnostico de ticks lentos en Windows).
+// El hilo de logica los lee al detectar un tick >36 ms y lo anota en hh_slow.log.
+static std::atomic<double> hh_last_send_dl_ms{0.0};
+static std::atomic<double> hh_last_update_screen_ms{0.0};
+extern "C" double hh_gfx_last_send_dl_ms(void) {
+    return hh_last_send_dl_ms.load(std::memory_order_relaxed);
+}
+extern "C" double hh_gfx_last_update_ms(void) {
+    return hh_last_update_screen_ms.load(std::memory_order_relaxed);
+}
+
 void vi_thread_func() {
     ultramodern::set_native_thread_name("VI Thread");
     // This thread should be prioritized over every other thread in the application, as it's what allows
@@ -342,8 +359,27 @@ void vi_thread_func() {
                 std::lock_guard lock{ events_context.message_mutex };
                 // Interrupt VI de hardware: lo consume viMgrMain (osCreateViManager lo registró
                 // con osSetEventMesg(OS_EVENT_VI)). La entrega al juego la hace el ROM.
+                // HH_VI_EVERY=N: entrega el evento solo cada N VI. Con N=2 el bucle de juego queda
+                // clavado a 2 VI/tick (30,0 Hz) como el original (medido en Fase 0: 0.5 hits/VI),
+                // en vez de 1,88-2,09 VI/tick (28,7-31,8 Hz) por ir el trabajo atado a la carga.
                 if (events_context.vi_event.mq != NULLPTR) {
-                    ultramodern::enqueue_external_message_src(events_context.vi_event.mq, events_context.vi_event.msg, false, ultramodern::EventMessageSource::Vi);
+                    static const int hh_vi_every = [] {
+                        const char* e = getenv("HH_VI_EVERY");
+                        if (e == nullptr || *e == '\0') return 1;
+                        int v = atoi(e);
+                        return (v >= 1) ? v : 1;
+                    }();
+                    if (hh_vi_every > 1) {
+                        static bool hh_vi_every_logged = false;
+                        if (!hh_vi_every_logged) {
+                            hh_vi_every_logged = true;
+                            fprintf(stderr, "[VI] HH_VI_EVERY=%d activo (entrega del evento VI al guest cada %d VI)\n",
+                                    hh_vi_every, hh_vi_every);
+                        }
+                    }
+                    if (hh_vi_every == 1 || (total_vis % (uint64_t)hh_vi_every) == 0) {
+                        ultramodern::enqueue_external_message_src(events_context.vi_event.mq, events_context.vi_event.msg, false, ultramodern::EventMessageSource::Vi);
+                    }
                 }
                 hh_evt_log("vi-deliver-ok", -1, events_context.vi_event.mq, (OSMesg)events_context.vi_event.msg, (unsigned long long)total_vis, -1);
                 // HH diag: vigilancia de los contextos de audio (voice+0x60/+0x64/+0x5C) y de la
@@ -434,6 +470,95 @@ void vi_thread_func() {
                         break;
                     }
                 }
+                {
+                    // HH_DUMP_CNT30 admite valores hex del contador 30 Hz del modulo 24 (0x801D8DA8)
+                    // y la palabra "reset" (primer paso a 0 tras VI >= 19000). Permite volcar port y
+                    // emulador en el MISMO punto logico (mismo cnt30) aunque el VI difiera por la
+                    // deriva de cadencia. Ver notes/2026-09-17-bizhawk-replay-freeze-con-rafaga.md.
+                    static bool cnt_parsed = false;
+                    static uint32_t cnt_list[32];
+                    static int cnt_count = 0;
+                    static bool cnt_reset = false;
+                    static bool cnt_done[32];
+                    static uint32_t cnt_prev = 0;
+                    static bool cnt_prev_init = false;
+                    if (!cnt_parsed) {
+                        cnt_parsed = true;
+                        const char* e = getenv("HH_DUMP_CNT30");
+                        if (e != nullptr) {
+                            char buf[512];
+                            strncpy(buf, e, sizeof(buf) - 1);
+                            buf[sizeof(buf) - 1] = 0;
+                            for (char* tok = strtok(buf, ","); tok != nullptr && cnt_count < 32; tok = strtok(nullptr, ",")) {
+                                if (strcmp(tok, "reset") == 0) { cnt_reset = true; continue; }
+                                cnt_list[cnt_count++] = (uint32_t)strtoul(tok, nullptr, 0);
+                            }
+                        }
+                    }
+                    if (cnt_count > 0 || cnt_reset) {
+                        uint8_t* g = events_context.rdram;
+                        uint32_t c = *(uint32_t*)&g[0x1D8DA8];
+                        auto dump = [&](const char* tag, unsigned long long val, char* path, size_t pathlen) {
+                            snprintf(path, pathlen, "work/debug/port_%s%llu.bin", tag, val);
+                            FILE* f = fopen(path, "wb");
+                            if (f) { fwrite(g, 1, 0x800000, f); fclose(f); fprintf(stderr, "[DUMP] %s %llu (vis=%llu) -> %s\n", tag, val, (unsigned long long)total_vis, path); }
+                        };
+                        char path[512];
+                        for (int i = 0; i < cnt_count; i++) {
+                            if (cnt_done[i] || c != cnt_list[i]) continue;
+                            cnt_done[i] = true;
+                            dump("cnt", cnt_list[i], path, sizeof(path));
+                        }
+                        if (cnt_reset && cnt_prev_init && cnt_prev > 0 && c == 0 && total_vis >= 19000) {
+                            cnt_reset = false;
+                            dump("reset_vi", (unsigned long long)total_vis, path, sizeof(path));
+                        }
+                        cnt_prev = c;
+                        cnt_prev_init = true;
+                    }
+                }
+                {
+                    // HH_DUMP_SAMPLE=<lista>: volcado cuando la muestra de replay aplicada (tick)
+                    // alcanza el valor. Para comparar con el emulador en el MISMO tick (su [HHR]).
+                    static bool ds_parsed = false;
+                    static uint64_t ds_list[32];
+                    static int ds_n = 0;
+                    static bool ds_done[32];
+                    if (!ds_parsed) {
+                        ds_parsed = true;
+                        const char* e = getenv("HH_DUMP_SAMPLE");
+                        if (e != nullptr && *e != '\0') {
+                            char buf[512];
+                            strncpy(buf, e, sizeof(buf) - 1);
+                            buf[sizeof(buf) - 1] = 0;
+                            for (char* tok = strtok(buf, ","); tok != nullptr && ds_n < 32; tok = strtok(nullptr, ",")) {
+                                ds_list[ds_n++] = strtoull(tok, nullptr, 0);
+                            }
+                        }
+                    }
+                    if (ds_n > 0) {
+                        uint64_t s = hh_replay_get_sample();
+                        for (int i = 0; i < ds_n; i++) {
+                            if (ds_done[i] || s != ds_list[i]) continue;
+                            ds_done[i] = true;
+                            uint8_t* g = events_context.rdram;
+                            char path[512];
+                            snprintf(path, sizeof(path), "work/debug/port_sample%llu.bin", (unsigned long long)s);
+                            FILE* f = fopen(path, "wb");
+                            if (f) { fwrite(g, 1, 0x800000, f); fclose(f); fprintf(stderr, "[DUMP] sample %llu (vis=%llu) -> %s\n", (unsigned long long)s, (unsigned long long)total_vis, path); }
+                        }
+                    }
+                }
+                // HH_M24LOG=1: traza por VI de la linea temporal del modulo 24 + muestra de replay
+                // aplicada. Permite comparar contra el state.log de la sesion original (BizHawk),
+                // que trae los mismos campos por frame (frame 2*sample con replay stride 2).
+                if (getenv("HH_M24LOG") != nullptr) {
+                    uint8_t* g = events_context.rdram;
+                    auto r32 = [&](uint32_t a){ return *(uint32_t*)&g[a & 0x1FFFFFFF]; };
+                    fprintf(stderr, "[M24] vis=%llu s=%llu cnt30=%08X g2=%08X d00=%08X cfc=%08X ce4=%08X\n",
+                            (unsigned long long)total_vis, (unsigned long long)hh_replay_get_sample(),
+                            r32(0x1D8DA8), r32(0x1D8CE8), r32(0x1D8D00), r32(0x1D8CFC), r32(0x1D8CE4));
+                }
                 // Per-frame evolution of the boot object (HH debug): +0x00..+0x2C.
                 if (ultramodern::debug::verbose()) {
                     uint8_t* g = events_context.rdram;
@@ -462,7 +587,11 @@ void vi_thread_func() {
                 if ((ai_fires++ % 60) == 0) {
                     HH_LOG("[AIEV] fire n=%llu vis=%llu mq=%p\n", (unsigned long long)ai_fires, (unsigned long long)total_vis, (void*)events_context.ai.mq);
                 }
-                ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
+                // HH: con HH_AI_FIFO=1 el evento solo se entrega cuando completa un buffer (como el
+                // interrupt AI del hardware); sin el flag se entrega cada VI (comportamiento antiguo).
+                if (hh_ai_fifo_poll()) {
+                    ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
+                }
             }
         }
 
@@ -621,9 +750,11 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 PTR(u64) displaylist = task_action->task.t.data_ptr;
                 ultramodern::extensions::on_displaylist_submitted(displaylist);
 
-                [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
+                auto renderer_start = std::chrono::high_resolution_clock::now();
                 renderer_context->send_dl(&task_action->task);
-                [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
+                auto renderer_end = std::chrono::high_resolution_clock::now();
+                hh_last_send_dl_ms.store(std::chrono::duration<double, std::milli>(renderer_end - renderer_start).count(),
+                                         std::memory_order_relaxed);
 
                 dp_complete(task_action->submitter);
                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
@@ -633,7 +764,11 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
             }
             else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
                 events_context.vi.update_screen_regs = screen_update_action->regs;
+                auto update_start = std::chrono::high_resolution_clock::now();
                 renderer_context->update_screen();
+                auto update_end = std::chrono::high_resolution_clock::now();
+                hh_last_update_screen_ms.store(std::chrono::duration<double, std::milli>(update_end - update_start).count(),
+                                               std::memory_order_relaxed);
                 display_refresh_rate = renderer_context->get_display_framerate();
                 resolution_scale = renderer_context->get_resolution_scale();
             }

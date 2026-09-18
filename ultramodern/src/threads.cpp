@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <unordered_map>
+#include <atomic>
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -293,15 +294,53 @@ void ultramodern::set_native_thread_name(const std::string& name) {
 void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
 #endif
 
+// HH: contabilidad global del tiempo en que un hilo guest esta EJECUTANDO (modelo single-CPU: solo
+// uno corre a la vez). Permite separar en hh_slow.log cuanto de un tick lento es codigo del juego
+// y cuanto esperas/sincronizacion. Se marca el fin/inicio de slice en los puntos de bloqueo.
+static std::atomic<uint64_t> hh_busy_accum_ns{0};
+static std::atomic<uint64_t> hh_busy_last_ns{0};
+static std::atomic<uint64_t> hh_busy_active_since_ns{0};
+static uint64_t hh_busy_now_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+extern "C" void hh_busy_end(void) {
+    const uint64_t now = hh_busy_now_ns();
+    const uint64_t last = hh_busy_last_ns.load(std::memory_order_relaxed);
+    if (last != 0) {
+        hh_busy_accum_ns.fetch_add(now - last, std::memory_order_relaxed);
+    }
+    hh_busy_last_ns.store(now, std::memory_order_relaxed);
+    hh_busy_active_since_ns.store(0, std::memory_order_relaxed);
+}
+extern "C" void hh_busy_start(void) {
+    const uint64_t now = hh_busy_now_ns();
+    hh_busy_last_ns.store(now, std::memory_order_relaxed);
+    hh_busy_active_since_ns.store(now, std::memory_order_relaxed);
+}
+extern "C" uint64_t hh_guest_busy_ms(void) {
+    return hh_busy_accum_ns.load(std::memory_order_relaxed) / 1000000ull;
+}
+// HH: duracion del slice guest EN CURSO (0 si ninguno). Lo usa el sampler de hh_slice.log para
+// capturar que funcion guest se esta ejecutando durante un stall largo.
+extern "C" uint64_t hh_busy_active_ms(void) {
+    const uint64_t since = hh_busy_active_since_ns.load(std::memory_order_relaxed);
+    if (since == 0) return 0;
+    return (hh_busy_now_ns() - since) / 1000000ull;
+}
+
 void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
     // Release the game lock so the thread being resumed can acquire it and run; then park this
     // thread. Re-acquire the lock once we're resumed.
     if (ultramodern::is_game_thread()) {
         hh_schedlog("park tid=%d ra=%08X\n", (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread())), hh_guest_ra());
     }
+    hh_busy_end();
     ultramodern::release_game_lock();
     thread_context->running.wait();
     ultramodern::acquire_game_lock();
+    hh_busy_start();
     hh_wake_t = hh_time_now();
     if (ultramodern::is_game_thread()) {
         hh_schedlog("wake tid=%d\n", (int)hh_sh_get_id(TO_PTR(OSThread, ultramodern::this_thread())));
