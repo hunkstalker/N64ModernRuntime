@@ -233,6 +233,10 @@ uint64_t total_vis = 0;
 static std::atomic<uint64_t> hh_vi_ticks{0};
 extern "C" uint64_t hh_get_vi_ticks() { return hh_vi_ticks.load(); }
 
+// HH: marca de tiempo (us desde el arranque) del ultimo VI, para el reloj determinista sub-VI.
+static std::atomic<int64_t> hh_vi_wall_us{0};
+extern "C" int64_t hh_get_vi_wall_us() { return hh_vi_wall_us.load(std::memory_order_relaxed); }
+
 // HH: contador de VI (frames de juego) expuesto para el replay determinista de input.
 extern "C" uint64_t hh_get_vi_count(void) { return total_vis; }
 
@@ -319,6 +323,11 @@ void vi_thread_func() {
             //printf("Skipped % " PRId64 " frames in VI interupt thread!\n", new_total_vis - total_vis - 1);
         }
         total_vis = new_total_vis;
+        // HH: marca de tiempo (us) del ultimo VI, para el reloj determinista sub-VI (HH_DET_CLOCK,
+        // ver timer.cpp). El hilo de VI la actualiza; el hilo de juego solo la lee.
+        hh_vi_wall_us.store(
+            std::chrono::duration_cast<std::chrono::microseconds>(time_now).count(),
+            std::memory_order_relaxed);
 
         // HH: canary de corrupcion (ver recomp.cpp). Compara las regiones de HH_CANARY una vez
         // por frame y loguea cualquier cambio que no haya pasado por los MEM_*.

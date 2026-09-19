@@ -743,45 +743,96 @@ static void hh_wrap_FUN_80003824(uint8_t* rdram, recomp_context* ctx) {
 // HH: cadena del nodo de boot: setter de callback (FUN_800058DC), dispatcher y pasos del
 // módulo 23 que deben avanzar 0x801CFE00/02.
 extern "C" int hh_get_callring(recomp_context* c, uint32_t* out, int max);
+// HH: al ver el veneno 0xFFFF84CD/0xFF7F84CD en a1, volcar la PILA GUEST (cadena de retornos) y el
+// anillo de llamadas a hh_venom.log. Es la via barata (solo el setter, ~1400 llamadas) para localizar
+// quien dispara el disable. OJO: comparar truncando a 32 bits. ADD32 firma-extiende a 64 bits
+// (0xFFFFFFFFFFFF84CD != 0xFFFF84CD), de modo que la comparacion directa nunca casaba: causa de que
+// hh_venom.log saliera vacio pese a que el wrapper si se ejecutaba.
+static void hh_dump_venom(const char* tag, uint8_t* rdram, recomp_context* ctx) {
+    if ((uint32_t)ctx->r5 != 0xFFFF84CDu && (uint32_t)ctx->r5 != 0xFF7F84CDu) return;
+    static FILE* vf = nullptr;
+    static int vn = 0;
+    if (vf == nullptr) vf = fopen("hh_venom.log", "w");
+    if (vf == nullptr || vn >= 12) return;
+    vn++;
+    uint32_t sp = (uint32_t)ctx->r29;
+    uint32_t a0 = (uint32_t)ctx->r4, a2 = (uint32_t)ctx->r6, a3 = (uint32_t)ctx->r7;
+    fprintf(vf, "=== VENOM #%d [%s] obj=%08X cb=%08X a2=%08X a3=%08X ra=%08X sp=%08X ===\n",
+            vn, tag, a0, (uint32_t)ctx->r5, a2, a3, (uint32_t)ctx->r31, sp);
+    fprintf(vf, "  stack-RA:");
+    int cnt = 0;
+    for (uint32_t a = sp; a < sp + 0x600u && a + 4 <= 0x80800000u; a += 4) {
+        uint32_t v = *(uint32_t*)(rdram + (a - 0x80000000u));
+        if (v >= 0x80000400u && v < 0x80800000u) {
+            if ((cnt % 5) == 0) fprintf(vf, "\n    +%03X:", a - sp);
+            fprintf(vf, " %08X", v);
+            if (++cnt >= 60) break;
+        }
+    }
+    fprintf(vf, "\n");
+    uint32_t ring[16];
+    int rn = hh_get_callring(ctx, ring, 16);
+    if (rn > 0) {
+        fprintf(vf, "  callring:");
+        for (int k = 0; k < rn; k++) fprintf(vf, " %08X", ring[k]);
+        fprintf(vf, "\n");
+    }
+    fflush(vf);
+}
 static recomp_func_t* hh_real_FUN_800058dc = nullptr;
 static void hh_wrap_FUN_800058dc(uint8_t* rdram, recomp_context* ctx) {
     if (getenv("HH_TBLTRACE") != nullptr) {
         fprintf(stderr, "[SETCB] obj=%08X cb=%08X\n", (unsigned)ctx->r4, (unsigned)ctx->r5);
     }
-    // HH: al ver el veneno, volcar la PILA GUEST (cadena de retornos) y el anillo de llamadas.
-    // Es la via barata (solo el setter, ~1400 llamadas) para localizar quien dispara el disable.
-    if (ctx->r5 == 0xFFFF84CDu || ctx->r5 == 0xFF7F84CDu) {
-        static FILE* vf = nullptr;
-        static int vn = 0;
-        if (vf == nullptr) vf = fopen("hh_venom.log", "w");
-        if (vf != nullptr && vn < 12) {
-            vn++;
-            uint32_t sp = (uint32_t)ctx->r29;
-            uint32_t a0 = (uint32_t)ctx->r4, a2 = (uint32_t)ctx->r6, a3 = (uint32_t)ctx->r7;
-            fprintf(vf, "=== VENOM #%d obj=%08X cb=%08X a2=%08X a3=%08X ra=%08X sp=%08X ===\n",
-                    vn, a0, (uint32_t)ctx->r5, a2, a3, (uint32_t)ctx->r31, sp);
-            fprintf(vf, "  stack-RA:");
-            int cnt = 0;
-            for (uint32_t a = sp; a < sp + 0x600u && a + 4 <= 0x80800000u; a += 4) {
-                uint32_t v = *(uint32_t*)(rdram + (a - 0x80000000u));
-                if (v >= 0x80000400u && v < 0x80800000u) {
-                    if ((cnt % 5) == 0) fprintf(vf, "\n    +%03X:", a - sp);
-                    fprintf(vf, " %08X", v);
-                    if (++cnt >= 60) break;
-                }
-            }
-            fprintf(vf, "\n");
+    // HH: quien PUBLICA el handler del disable (M10_FUN_8021b280) en el objeto del CaC. Al verlo en
+    // a1, volcar el contexto del llamante + anillo a hh_b280set.log. Gated HH_B280TRACE.
+    if ((uint32_t)ctx->r5 == 0x8021B280u && getenv("HH_B280TRACE") != nullptr) {
+        static FILE* sf = nullptr;
+        static int sn = 0;
+        if (sf == nullptr) sf = fopen("hh_b280set.log", "w");
+        if (sf != nullptr && sn < 32) {
+            sn++;
+            // HH: direccion de retorno NATIVA del llamante (la que invoca el puntero del wrapper),
+            // relativa a la propia funcion para poder simbolizarla con nm/addr2line del binario.
+            void* nret = HH_RETURN_ADDR();
+            long long rel = (long long)((intptr_t)nret - (intptr_t)&hh_wrap_FUN_800058dc);
+            fprintf(sf, "=== SET b280 #%d obj=%08X sp=%08X ra=%08X a2=%08X a3=%08X host_rel=%lld ===\n",
+                    sn, (unsigned)ctx->r4, (unsigned)ctx->r29, (unsigned)ctx->r31,
+                    (unsigned)ctx->r6, (unsigned)ctx->r7, rel);
             uint32_t ring[16];
             int rn = hh_get_callring(ctx, ring, 16);
             if (rn > 0) {
-                fprintf(vf, "  callring:");
-                for (int k = 0; k < rn; k++) fprintf(vf, " %08X", ring[k]);
-                fprintf(vf, "\n");
+                fprintf(sf, "  callring:");
+                for (int k = 0; k < rn; k++) fprintf(sf, " %08X", ring[k]);
+                fprintf(sf, "\n");
             }
-            fflush(vf);
+            fflush(sf);
         }
     }
+    hh_dump_venom("800058dc", rdram, ctx);
+    // HH: workaround OPT-IN HH_NO_DISABLE=1. El sentinel 0xFFFF84CD/0xFF7F84CD es el "disable" que el
+    // emulador NUNCA aplica (mantiene el callback sano, p. ej. 801CB71C). Ignorar esa escritura evita
+    // que el CaC quede envenenado y congele. NO es el fix de raiz (la divergencia es de timing); sirve
+    // para validar en vivo si el disable es el unico bloqueo. Ver notes/2026-09-19-*.
+    if (getenv("HH_NO_DISABLE") != nullptr &&
+        ((uint32_t)ctx->r5 == 0xFFFF84CDu || (uint32_t)ctx->r5 == 0xFF7F84CDu)) {
+        static int nd = 0;
+        if (nd < 20) {
+            nd++;
+            fprintf(stderr, "[NO_DISABLE] obj=%08X cb=%08X (escritura ignorada)\n",
+                    (unsigned)ctx->r4, (unsigned)ctx->r5);
+        }
+        return;
+    }
     hh_real_FUN_800058dc(rdram, ctx);
+}
+// HH: FUN_800058f4 es el cuerpo general del setter (continuacion por fallthrough de 0x800058DC).
+// Se engancha tambien por si algun modulo lo invoca por LOOKUP_FUNC (las llamadas directas del C
+// generado, p. ej. la continuacion en funcs_1.c, no pasan por get_function).
+static recomp_func_t* hh_real_FUN_800058f4 = nullptr;
+static void hh_wrap_FUN_800058f4(uint8_t* rdram, recomp_context* ctx) {
+    hh_dump_venom("800058f4", rdram, ctx);
+    hh_real_FUN_800058f4(rdram, ctx);
 }
 static recomp_func_t* hh_real_FUN_80005270 = nullptr;
 static void hh_wrap_FUN_80005270(uint8_t* rdram, recomp_context* ctx) {
@@ -1030,8 +1081,24 @@ static void hh_wrap_M24_FUN_801bf61c(uint8_t* rdram, recomp_context* ctx) {
     hh_real_M24_FUN_801bf61c(rdram, ctx);
 }
 static recomp_func_t* hh_real_FUN_80031190 = nullptr; // osGetTime (reimpl)
+extern "C" uint8_t* hh_get_rdram_base(void);
 static void hh_wrap_FUN_80031190(uint8_t* rdram, recomp_context* ctx) {
     hh_real_FUN_80031190(rdram, ctx);
+    // HH: diagnostico del target del frame limiter (M7_FUN_80133AA0 lee [0x8017AA90]). Una vez, ya
+    // arrancado el juego. Gated HH_CLOCKDIAG.
+    if (getenv("HH_CLOCKDIAG") != nullptr) {
+        static bool done = false;
+        uint64_t vi = hh_get_vi_count();
+        if (!done && vi > 400 && vi < 1000) {
+            done = true;
+            uint8_t* rb = hh_get_rdram_base();
+            uint32_t target = rb ? *(uint32_t*)(rb + (0x8017AA90u - 0x80000000u)) : 0;
+            uint64_t t = ((uint64_t)(uint32_t)ctx->r2 << 32) | (uint32_t)ctx->r3;
+            fprintf(stderr, "[CLOCK] target[0x8017AA90]=%u (0x%X) VI=%llu osGetTime=%llu (%llu ms)\n",
+                    target, target, (unsigned long long)vi,
+                    (unsigned long long)t, (unsigned long long)(t / 46875));
+        }
+    }
     if (getenv("HH_LSTTRACE") != nullptr) {
         static unsigned long long n = 0;
         uint64_t vi = hh_get_vi_count();
@@ -1436,6 +1503,52 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
                 (unsigned long long)HH_RETURN_RVA(),
                 func_find != func_map.end() ? (const void*)func_find->second : nullptr);
     }
+    // HH: diagnostico del disparador del disable (M10_FUN_8021b280). Al resolverlo, volcar el
+    // contexto del llamante y localizar el/los slot(s) de RDRAM que guardan su puntero (para cazar
+    // quien lo publica). Gated por HH_B280TRACE. Ver notes/2026-09-19-*.
+    if ((uint32_t)addr == 0x8021B280u && getenv("HH_B280TRACE") != nullptr) {
+        recomp_context* hc_b = hh_get_current_ctx();
+        uint8_t* rb_b = hh_get_rdram_base();
+        static FILE* bf = nullptr;
+        static int bn = 0;
+        if (bf == nullptr) bf = fopen("hh_b280.log", "w");
+        if (bf != nullptr && bn < 32) {
+            bn++;
+            fprintf(bf, "=== B280 #%d vi=%llu sample=%llu a0=%08X a1=%08X a2=%08X a3=%08X sp=%08X ra=%08X ===\n",
+                    bn, (unsigned long long)hh_get_vi_count(), (unsigned long long)hh_replay_get_sample(),
+                    hc_b ? (unsigned)hc_b->r4 : 0, hc_b ? (unsigned)hc_b->r5 : 0,
+                    hc_b ? (unsigned)hc_b->r6 : 0, hc_b ? (unsigned)hc_b->r7 : 0,
+                    hc_b ? (unsigned)hc_b->r29 : 0, hc_b ? (unsigned)hc_b->r31 : 0);
+            if (rb_b != nullptr) {
+                int found = 0;
+                for (uint32_t o = 0; o + 16u <= 0x400000u; o += 4) {
+                    if (*(uint32_t*)(rb_b + o) == 0x8021B280u) {
+                        uint32_t base = o & ~0xFu;
+                        fprintf(bf, "  slot=%08X ctx:", o | 0x80000000u);
+                        for (uint32_t k = 0; k < 4; k++) fprintf(bf, " %08X", *(uint32_t*)(rb_b + base + k * 4));
+                        fprintf(bf, "\n");
+                        if (++found >= 16) break;
+                    }
+                }
+                fprintf(bf, "  slots=%d\n", found);
+                // HH: variables de la PUERTA que decide instalar b280 (M7_FUN_80126A18):
+                // 0x801BBD78 (0x188), 0x801BBD71 (0x181), timer 0x8008D580 (0x42D0), 0x8008D5AF (0x42FF).
+                auto rw = [&](uint32_t a) { return *(uint32_t*)(rb_b + (a - 0x80000000u)); };
+                auto rb8 = [&](uint32_t a) { return (unsigned)rb_b[a - 0x80000000u]; };
+                fprintf(bf, "  gate: 188=%08X 181=%02X timer42D0=%08X 42FF=%02X mode7DD92=%02X\n",
+                        rw(0x801BBD78u), rb8(0x801BBD71u), rw(0x8008D580u), rb8(0x8008D5AFu),
+                        rb8(0x8017DD92u));
+            }
+            uint32_t ring[16];
+            int rn = hh_get_callring(hc_b, ring, 16);
+            if (rn > 0) {
+                fprintf(bf, "  callring:");
+                for (int k = 0; k < rn; k++) fprintf(bf, " %08X", ring[k]);
+                fprintf(bf, "\n");
+            }
+            fflush(bf);
+        }
+    }
     if (func_find == func_map.end()) {
         // HH: diagnostico del LLAMANTE. Un target invalido (p. ej. 0xFF7F84CD) suele ser un puntero
         // de funcion corrupto, no un simbolo sin registrar. `ra` identifica al que intenta llamarlo.
@@ -1522,6 +1635,12 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
             hh_real_FUN_800058dc = func_find->second;
         }
         return hh_wrap_FUN_800058dc;
+    }
+    if ((uint32_t)addr == 0x800058F4) {
+        if (hh_real_FUN_800058f4 == nullptr) {
+            hh_real_FUN_800058f4 = func_find->second;
+        }
+        return hh_wrap_FUN_800058f4;
     }
     if (hh_tbltrace_on) {
         switch ((uint32_t)addr) {

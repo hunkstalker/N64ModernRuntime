@@ -2,6 +2,7 @@
 #include <variant>
 #include <set>
 #include <cstdlib>
+#include <cstring>
 #include "blockingconcurrentqueue.h"
 
 #include "ultramodern/ultra64.h"
@@ -31,8 +32,43 @@ static constexpr int64_t hh_ticks_per_sec = 46'875'000; // counter_per_ms * 1000
 // HH: interpolacion DETERMINISTA del reloj de replay: en vez de avanzar con tiempo de pared real
 // (que hacia el replay no reproducible), avanza por VI (como el N64). 60 VI/s.
 extern "C" uint64_t hh_get_vi_count(void);
+extern "C" int64_t hh_get_vi_wall_us(void);
 static uint64_t hh_replay_vi0 = 0;      // VI al aplicar la ultima muestra
 static constexpr int64_t hh_counter_per_vi = (int64_t)46'875 * 1000 / 60; // 781250
+// HH: reloj de juego DETERMINISTA continuo anclado al VI (HH_DET_CLOCK=1). La parte entera avanza con
+// el contador de VI (60 VI/s exactos) y el residuo sub-VI se interpola con un reloj monotono DESDE EL
+// ULTIMO VI (marca del hilo de VI), acotado a <1 VI. Asi el jitter del hilo de juego no acumula en el
+// contador (se re-ancla cada VI) y el frame limiter dispone de resolucion sub-VI para no cuantizar a
+// 3 VI. Ver notes/2026-09-19-veneno-capturado-bug-signo-extension.md.
+static bool hh_det_clock_on() {
+    static const bool on = [] {
+        const char* v = getenv("HH_DET_CLOCK");
+        return v != nullptr && *v != '\0' && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+// HH_DET_CLOCK_BIAS: ticks extra por VI (deterministas, acotados). Compensa el truncado a ms del
+// frame limiter del juego (que si no exige un 3er VI). Def 0; sugerido ~15625 para 30 fps exactos.
+static int64_t hh_det_clock_bias() {
+    static const int64_t b = [] {
+        const char* v = getenv("HH_DET_CLOCK_BIAS");
+        if (v == nullptr || *v == '\0') return (int64_t)0;
+        return (int64_t)strtoll(v, nullptr, 0);
+    }();
+    return b;
+}
+static int64_t hh_det_clock_value() {
+    uint64_t vi = hh_get_vi_count();
+    int64_t last_us = hh_get_vi_wall_us();
+    int64_t now_us = (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        ultramodern::time_since_start()).count();
+    int64_t sub_us = now_us - last_us;
+    if (sub_us < 0) sub_us = 0;
+    if (sub_us > 16667) sub_us = 16667;
+    int64_t sub_ticks = sub_us * (int64_t)46'875 / 1000;
+    int64_t bias = hh_det_clock_bias();
+    return (int64_t)vi * (hh_counter_per_vi + bias) + sub_ticks;
+}
 // Game speed multiplier (1 means no speedup)
 constexpr uint32_t speed_multiplier = 1;
 // N64 CPU counter ticks per millisecond
@@ -231,6 +267,9 @@ extern "C" u32 osGetCount() {
         int64_t extra = (int64_t)(hh_get_vi_count() - hh_replay_vi0) * hh_counter_per_vi;
         return (uint32_t)(hh_replay_time + extra);
     }
+    if (hh_det_clock_on()) {
+        return (uint32_t)hh_det_clock_value();
+    }
     uint64_t total_count = time_now();
 
     // Allow for overflows, which is how osGetCount behaves
@@ -247,6 +286,9 @@ extern "C" OSTime osGetTime() {
         // para que el replay sea reproducible (los waits por osGetTime consumen los mismos VI).
         int64_t extra = (int64_t)(hh_get_vi_count() - hh_replay_vi0) * hh_counter_per_vi;
         return (OSTime)(hh_replay_time + extra);
+    }
+    if (hh_det_clock_on()) {
+        return (OSTime)hh_det_clock_value();
     }
     uint64_t total_count = time_now() - ostime_offset;
 
