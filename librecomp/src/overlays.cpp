@@ -726,10 +726,11 @@ extern "C" void hh_trans_load(uint8_t* rdram, recomp_context* ctx, recomp_func_t
 static void hh_wrap_FUN_80003824(uint8_t* rdram, recomp_context* ctx) {
     uint32_t src = (uint32_t)ctx->r4;
     uint32_t dst = (uint32_t)ctx->r5;
-    if (getenv("HH_TBLTRACE") != nullptr) {
-        fprintf(stderr, "[LD384] a0=%08X a1=%08X a2=%08X a3=%08X s=%llu\n",
+    if (getenv("HH_LDTRACE") != nullptr || getenv("HH_TBLTRACE") != nullptr) {
+        fprintf(stderr, "[LD384] a0=%08X a1=%08X a2=%08X a3=%08X vi=%llu s=%llu ra=%08X\n",
                 src, dst, (unsigned)ctx->r6, (unsigned)ctx->r7,
-                (unsigned long long)hh_replay_get_sample());
+                (unsigned long long)hh_get_vi_count(),
+                (unsigned long long)hh_replay_get_sample(), (unsigned)ctx->r31);
     }
     hh_trans_load(rdram, ctx, hh_real_FUN_80003824);
     // HH: tras la descompresion, el byte en 0x801CC8C4 (offset 0xD724 de la base 0x801BF1A0) dice
@@ -810,6 +811,20 @@ static void hh_wrap_FUN_800058dc(uint8_t* rdram, recomp_context* ctx) {
         }
     }
     hh_dump_venom("800058dc", rdram, ctx);
+    // HH: workaround OPT-IN HH_NO_B280=1 ("forzar la ruta del emulador"). Ignora la PUBLICACION del
+    // handler 0x8021B280 en el setter: M10_FUN_8021b240 corre (y su gate), pero b280 nunca queda
+    // instalado ni se ejecuta. El emulador jamás ejecuta b280/M55_FUN_80379410 con el mismo input
+    // (contralado 0 veces), asi que este hook reproduce su conducta un paso aguas arriba del sentinel
+    // (HH_NO_DISABLE solo ignoraba la escritura final y no bastaba). Ver notes/2026-09-19-*.
+    if (getenv("HH_NO_B280") != nullptr && (uint32_t)ctx->r5 == 0x8021B280u) {
+        static int nb = 0;
+        if (nb < 20) {
+            nb++;
+            fprintf(stderr, "[NO_B280] obj=%08X handler=%08X (publicacion ignorada)\n",
+                    (unsigned)ctx->r4, (unsigned)ctx->r5);
+        }
+        return;
+    }
     // HH: workaround OPT-IN HH_NO_DISABLE=1. El sentinel 0xFFFF84CD/0xFF7F84CD es el "disable" que el
     // emulador NUNCA aplica (mantiene el callback sano, p. ej. 801CB71C). Ignorar esa escritura evita
     // que el CaC quede envenenado y congele. NO es el fix de raiz (la divergencia es de timing); sirve
@@ -833,6 +848,53 @@ static recomp_func_t* hh_real_FUN_800058f4 = nullptr;
 static void hh_wrap_FUN_800058f4(uint8_t* rdram, recomp_context* ctx) {
     hh_dump_venom("800058f4", rdram, ctx);
     hh_real_FUN_800058f4(rdram, ctx);
+}
+// HH: traza de la puerta M7_FUN_80126CC0 (la que consulta M12_FUN_80242db4 para armar el contador
+// [obj+0xA8] del callback M12_FUN_80242e90; el softlock tiene ese contador a 0). Gate HH_M7GATE=1,
+// filtra a1==0x80127014 (el argumento que pasa M12_FUN_80242db4) y registra el retorno + las flags
+// que mira la puerta (globales 0x188/0x181 y campos del objeto). Ver notes/2026-09-19-bat-stall-check.md.
+static recomp_func_t* hh_real_M7_FUN_80126cc0 = nullptr;
+static void hh_wrap_M7_FUN_80126cc0(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t a0 = (uint32_t)ctx->r4, a1 = (uint32_t)ctx->r5;
+    hh_real_M7_FUN_80126cc0(rdram, ctx);
+    static const bool on = getenv("HH_M7GATE") != nullptr;
+    if (!on || a1 != 0x80127014u) return;
+    auto r32 = [&](uint32_t a) -> uint32_t {
+        return *(uint32_t*)(rdram + ((a - 0x80000000u) & 0x7FFFFF));
+    };
+    auto r16 = [&](uint32_t a) -> uint32_t {
+        return *(uint16_t*)(rdram + (((a) ^ 2u) & 0x7FFFFF));
+    };
+    static int n = 0;
+    if (n++ < 400) {
+        uint32_t p38 = r32(a0 + 0x38);
+        fprintf(stderr,
+                "[M7GATE] #%d a0=%08X ret=%u 188=%08X 181=%02X p38=%08X p38+1E=%04X a0+36=%04X a0+2C=%08X\n",
+                n, a0, (unsigned)ctx->r2, r32(0x801BBD78), r32(0x801BBD71) & 0xFFu,
+                p38, r16(p38 + 0x1E), r16(a0 + 0x36), r32(a0 + 0x2C));
+    }
+}
+// HH: traza de la PUERTA DEL DISABLE M7_FUN_80126A0C (la que consulta M10_FUN_8021b240 con
+// (obj,0x39,1) para instalar b280). Gate HH_GATE_A=1; filtra a1==0x39. Registra retorno + las
+// variables que mira la puerta. Comparar port<->emu para ver por que el port abre la rama M10/M12.
+static recomp_func_t* hh_real_M7_FUN_80126a0c = nullptr;
+static void hh_wrap_M7_FUN_80126a0c(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t a0 = (uint32_t)ctx->r4, a1 = (uint32_t)ctx->r5, a2 = (uint32_t)ctx->r6;
+    hh_real_M7_FUN_80126a0c(rdram, ctx);
+    static const bool on = getenv("HH_GATE_A") != nullptr;
+    if (!on) return;
+    static int total = 0, hits = 0;
+    total++;
+    if (a1 != 0x39u) return;
+    auto r32 = [&](uint32_t a) -> uint32_t {
+        return *(uint32_t*)(rdram + ((a - 0x80000000u) & 0x7FFFFF));
+    };
+    if (hits++ < 200) {
+        fprintf(stderr,
+                "[GATE_A] #%d/%d a0=%08X a1=%08X a2=%08X ret=%u 42D0=%08X 181=%02X 188=%08X mode7DD92=%08X\n",
+                hits, total, a0, a1, a2, (unsigned)ctx->r2, r32(0x8008D580),
+                r32(0x801BBD71) & 0xFFu, r32(0x801BBD78), r32(0x8017DD92));
+    }
 }
 static recomp_func_t* hh_real_FUN_80005270 = nullptr;
 static void hh_wrap_FUN_80005270(uint8_t* rdram, recomp_context* ctx) {
@@ -995,6 +1057,26 @@ static void hh_wrap_M24_FUN_801bffac(uint8_t* rdram, recomp_context* ctx) {
             (unsigned long long)hh_get_vi_count(), r32(0x801D8CE8), r32(0x801D8CE8) + 1, r32(0x801D8CF0));
     }
     hh_real_M24_FUN_801bffac(rdram, ctx);
+}
+// HH: M24_FUN_801c0a30 fija la epoch de la linea temporal: 0x801D8D80/84 = retorno de
+// M24_FUN_801C0C08 (osGetTime escalado). Traza HH_EPOCHTRACE para ver cuando/que valory por que el
+// port la fija ~16 s antes que el emulador (nota 2026-09-19 Syntesis).
+static recomp_func_t* hh_real_M24_FUN_801c0a30 = nullptr;
+static void hh_wrap_M24_FUN_801c0a30(uint8_t* rdram, recomp_context* ctx) {
+    auto r32 = [&](uint32_t a) -> uint32_t {
+        return *(uint32_t*)(rdram + ((a - 0x80000000u) & 0x7FFFFF));
+    };
+    static const bool on = getenv("HH_EPOCHTRACE") != nullptr;
+    if (on) {
+        fprintf(stderr, "[EPOCH] ENTER vi=%llu epoch_prev=%08X%08X\n",
+                (unsigned long long)hh_get_vi_count(), r32(0x801D8D80), r32(0x801D8D84));
+    }
+    hh_real_M24_FUN_801c0a30(rdram, ctx);
+    if (on) {
+        fprintf(stderr, "[EPOCH] SET vi=%llu epoch=%08X%08X (helper_ret=%08X:%08X)\n",
+                (unsigned long long)hh_get_vi_count(), r32(0x801D8D80), r32(0x801D8D84),
+                (unsigned)ctx->r2, (unsigned)ctx->r3);
+    }
 }
 static recomp_func_t* hh_real_FUN_801C0B8C = nullptr;
 static void hh_wrap_FUN_801C0B8C(uint8_t* rdram, recomp_context* ctx) {
@@ -1641,6 +1723,27 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
             hh_real_FUN_800058f4 = func_find->second;
         }
         return hh_wrap_FUN_800058f4;
+    }
+    // HH: puerta M7 que arma el contador del callback de la transicion (traza HH_M7GATE).
+    if ((uint32_t)addr == 0x80126CC0) {
+        if (hh_real_M7_FUN_80126cc0 == nullptr) {
+            hh_real_M7_FUN_80126cc0 = func_find->second;
+        }
+        return hh_wrap_M7_FUN_80126cc0;
+    }
+    // HH: puerta del disable (traza HH_GATE_A).
+    if ((uint32_t)addr == 0x80126A0C) {
+        if (hh_real_M7_FUN_80126a0c == nullptr) {
+            hh_real_M7_FUN_80126a0c = func_find->second;
+        }
+        return hh_wrap_M7_FUN_80126a0c;
+    }
+    // HH: fijacion de la epoch de la linea temporal M24 (traza HH_EPOCHTRACE).
+    if ((uint32_t)addr == 0x801C0A30) {
+        if (hh_real_M24_FUN_801c0a30 == nullptr) {
+            hh_real_M24_FUN_801c0a30 = func_find->second;
+        }
+        return hh_wrap_M24_FUN_801c0a30;
     }
     if (hh_tbltrace_on) {
         switch ((uint32_t)addr) {

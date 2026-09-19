@@ -47,6 +47,17 @@ static bool hh_det_clock_on() {
     }();
     return on;
 }
+// HH: A1 — variante CUANTIZADA del reloj determinista: HH_DET_CLOCK=quant (o =2). Devuelve
+// `vi * 781250` exacto, SIN interpolar el residuo sub-VI con reloj de host. Asi el frame limiter del
+// juego (0x80001A88, que compara (osGetTime-last) contra 1/30 s) cruza el umbral exactamente en la
+// rejilla VI (2 VI) y deja de deslizar un 3er VI por jitter. Ver notes/2026-09-19-bat-stall-check.md.
+static bool hh_det_clock_quant() {
+    static const bool q = [] {
+        const char* v = getenv("HH_DET_CLOCK");
+        return v != nullptr && (strcmp(v, "quant") == 0 || strcmp(v, "2") == 0);
+    }();
+    return q;
+}
 // HH_DET_CLOCK_BIAS: ticks extra por VI (deterministas, acotados). Compensa el truncado a ms del
 // frame limiter del juego (que si no exige un 3er VI). Def 0; sugerido ~15625 para 30 fps exactos.
 static int64_t hh_det_clock_bias() {
@@ -59,13 +70,16 @@ static int64_t hh_det_clock_bias() {
 }
 static int64_t hh_det_clock_value() {
     uint64_t vi = hh_get_vi_count();
-    int64_t last_us = hh_get_vi_wall_us();
-    int64_t now_us = (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-        ultramodern::time_since_start()).count();
-    int64_t sub_us = now_us - last_us;
-    if (sub_us < 0) sub_us = 0;
-    if (sub_us > 16667) sub_us = 16667;
-    int64_t sub_ticks = sub_us * (int64_t)46'875 / 1000;
+    int64_t sub_ticks = 0;
+    if (!hh_det_clock_quant()) {
+        int64_t last_us = hh_get_vi_wall_us();
+        int64_t now_us = (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            ultramodern::time_since_start()).count();
+        int64_t sub_us = now_us - last_us;
+        if (sub_us < 0) sub_us = 0;
+        if (sub_us > 16667) sub_us = 16667;
+        sub_ticks = sub_us * (int64_t)46'875 / 1000;
+    }
     int64_t bias = hh_det_clock_bias();
     return (int64_t)vi * (hh_counter_per_vi + bias) + sub_ticks;
 }
