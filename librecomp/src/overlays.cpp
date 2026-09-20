@@ -281,9 +281,22 @@ void recomp::overlays::register_module_sources(const ModuleSource* sources, size
 // Registers every function of every code section at its absolute ram_addr. This is used for flat
 // (non-overlay) code where each section has its own absolute ram_addr that isn't entrypoint-relative.
 void recomp::overlays::register_flat_code() {
+    // HH: las secciones listadas en overlays_info.table (los 91 code files per-file) son
+    // RELOCALIZABLES: no se registran en su base fija (el juego reutiliza/intercambia bases y las
+    // registra al cargarse con load_overlay_by_id, via los hooks de loader del port). Solo la
+    // imagen residente (.text, no listada) se registra aqui.
+    auto is_relocatable = [](size_t section_index) {
+        for (size_t i = 0; i < overlays_info.len; i++) {
+            if ((size_t)overlays_info.table[i] == section_index) {
+                return true;
+            }
+        }
+        return false;
+    };
     for (size_t section_index = 0; section_index < sections_info.num_code_sections; section_index++) {
-        // HH: los módulos con registro dinámico (module_sources) NO se registran en su base fija:
-        // el juego puede reutilizar la misma VRAM para otro módulo (se registran al cargarse).
+        if (is_relocatable(section_index)) {
+            continue;
+        }
         if (module_rom_addrs.count(sections_info.code_sections[section_index].rom_addr) != 0) {
             continue;
         }

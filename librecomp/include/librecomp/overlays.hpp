@@ -77,5 +77,9 @@ namespace recomp {
 
 extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size);
 extern "C" void unload_overlays(int32_t ram_addr, uint32_t size);
+// HH: registro por id de overlay (indice en overlays.txt / overlay_sections_by_index). El port
+// envuelve los loaders del juego y llama a estas al cargar/descargar un fichero de codigo.
+extern "C" void load_overlay_by_id(uint32_t id, uint32_t ram_addr);
+extern "C" void unload_overlay_by_id(uint32_t id);
 
 #endif
