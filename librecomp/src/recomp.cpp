@@ -583,6 +583,12 @@ extern "C" uint32_t hh_current_sp() {
     return hh_current_ctx != nullptr ? (uint32_t)hh_current_ctx->r29 : 0;
 }
 
+// HH: ra (r31) del contexto del hilo actual, o 0. Para saber quien llama (p.ej. a osSendMesg con una
+// cola corrupta).
+extern "C" uint32_t hh_current_ra() {
+    return hh_current_ctx != nullptr ? (uint32_t)hh_current_ctx->r31 : 0;
+}
+
 // HH: registro de los contextos de todos los hilos de juego vivos. El watchdog de cuelgue del
 // port lo usa para volcar donde esta atascado cada hilo (RA/SP = punto de bloqueo).
 // HH: anillo de las ultimas llamadas guest por hilo (para el watchdog: localizar bucles que no

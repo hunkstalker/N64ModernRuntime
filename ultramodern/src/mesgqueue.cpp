@@ -16,6 +16,7 @@
 // HH: diagnostico de fuga de pila (ver recomp.cpp).
 extern "C" double hh_time_now(void);
 extern "C" int hh_diag_enabled(void);
+extern "C" uint32_t hh_current_ra(void);
 extern "C" uint32_t hh_current_sp(void);
 extern "C" int hh_ring2_count(void);
 extern "C" void hh_ring2_dump_last(FILE*, int);
@@ -415,7 +416,8 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block, P
         uint32_t mp = (uint32_t)mq_;
         if (mp != 0 && (mp < 0x80000000u || mp >= 0x80800000u || (mp & 3u))) {
             static int hh_n = 0;
-            if (hh_n++ < 40) fprintf(stderr, "[BADMQ] fields ptr mq=%08X msg=%08X\n", mp, (unsigned)msg);
+            if (hh_n++ < 40) fprintf(stderr, "[BADMQ] fields ptr mq=%08X msg=%08X ra=%08X sp=%08X\n",
+                                     mp, (unsigned)msg, hh_current_ra(), hh_current_sp());
             return false;
         }
         if (mp != 0) {
@@ -425,9 +427,9 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block, P
                 mbuf < 0x80000000u || mbuf >= 0x80800000u || (mbuf & 3u)) {
                 static int hh_n = 0;
                 if (hh_n++ < 40) {
-                    fprintf(stderr, "[BADMQ] fields mq=%08X msgCount=%d valid=%d first=%d msg=%08X (msg=%08X)\n",
+                    fprintf(stderr, "[BADMQ] fields mq=%08X msgCount=%d valid=%d first=%d msg=%08X (msg=%08X ra=%08X sp=%08X)\n",
                             mp, (int)mq_chk->msgCount, (int)mq_chk->validCount, (int)mq_chk->first,
-                            mbuf, (unsigned)msg);
+                            mbuf, (unsigned)msg, hh_current_ra(), hh_current_sp());
                 }
                 return false;
             }

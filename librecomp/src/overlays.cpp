@@ -218,6 +218,7 @@ static bool hh_owner_watched(uint32_t a) {
 }
 
 extern "C" uint64_t hh_get_vi_count(void);
+extern "C" uint64_t hh_get_game_frame_count(void);
 extern "C" uint64_t hh_replay_get_sample(void);
 
 // HH: traza BASE-AWARE por offset de modulo (HH_MODTRACE=[rom:]offset:label,...). Localiza la
@@ -727,9 +728,10 @@ static void hh_wrap_FUN_80003824(uint8_t* rdram, recomp_context* ctx) {
     uint32_t src = (uint32_t)ctx->r4;
     uint32_t dst = (uint32_t)ctx->r5;
     if (getenv("HH_LDTRACE") != nullptr || getenv("HH_TBLTRACE") != nullptr) {
-        fprintf(stderr, "[LD384] a0=%08X a1=%08X a2=%08X a3=%08X vi=%llu s=%llu ra=%08X\n",
+        fprintf(stderr, "[LD384] a0=%08X a1=%08X a2=%08X a3=%08X vi=%llu gframe=%llu s=%llu ra=%08X\n",
                 src, dst, (unsigned)ctx->r6, (unsigned)ctx->r7,
                 (unsigned long long)hh_get_vi_count(),
+                (unsigned long long)hh_get_game_frame_count(),
                 (unsigned long long)hh_replay_get_sample(), (unsigned)ctx->r31);
     }
     hh_trans_load(rdram, ctx, hh_real_FUN_80003824);
@@ -896,6 +898,77 @@ static void hh_wrap_M7_FUN_80126a0c(uint8_t* rdram, recomp_context* ctx) {
                 r32(0x801BBD71) & 0xFFu, r32(0x801BBD78), r32(0x8017DD92));
     }
 }
+// HH: traza de la CADENA DE INSTALACION DE CALLBACKS del disable del CaC (gate HH_CHAINTRACE=1).
+// Secuencia: M10_FUN_8021b1A8 -> (setter FUN_800058dc) instala M10_FUN_8021b200 -> instala
+// M10_FUN_8021b240 -> (puerta 0x39) instala M10_FUN_8021b280 (disable). Cada paso lo dispara el
+// scheduler FUN_80004bb0. Ver notes/2026-09-19-causa-raiz-cadencia-frames.md seccion 10.
+static recomp_func_t* hh_real_M10_FUN_8021b1A8 = nullptr;
+static recomp_func_t* hh_real_M10_FUN_8021b200 = nullptr;
+static recomp_func_t* hh_real_M10_FUN_8021b240 = nullptr;
+static recomp_func_t* hh_real_FUN_80004bb0 = nullptr;
+static void hh_chain_log(const char* what, uint32_t a0, uint32_t a1, uint32_t extra) {
+    static FILE* f = nullptr;
+    if (f == nullptr) f = fopen("hh_chain.log", "w");
+    if (f == nullptr) return;
+    fprintf(f, "[CHAIN] vi=%llu sample=%llu %-10s a0=%08X a1=%08X extra=%08X\n",
+            (unsigned long long)hh_get_vi_count(), (unsigned long long)hh_replay_get_sample(),
+            what, a0, a1, extra);
+    fflush(f);
+}
+static void hh_wrap_M10_FUN_8021b1A8(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t a0 = (uint32_t)ctx->r4, a1 = (uint32_t)ctx->r5;
+    hh_chain_log("b1A8-in", a0, a1, 0);
+    hh_real_M10_FUN_8021b1A8(rdram, ctx);
+}
+static void hh_wrap_M10_FUN_8021b200(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t a0 = (uint32_t)ctx->r4, a1 = (uint32_t)ctx->r5;
+    hh_chain_log("b200-in", a0, a1, 0);
+    hh_real_M10_FUN_8021b200(rdram, ctx);
+}
+static void hh_wrap_M10_FUN_8021b240(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t a0 = (uint32_t)ctx->r4, a1 = (uint32_t)ctx->r5;
+    hh_chain_log("b240-in", a0, a1, 0);
+    hh_real_M10_FUN_8021b240(rdram, ctx);
+    hh_chain_log("b240-out", a0, a1, (uint32_t)ctx->r2);
+}
+// HH: scheduler de eventos temporizados (FUN_80004bb0). Loguea a0 (id), a1 y los tiempos que
+// gobiernan el disparo (0x42CC/0x42BC/0x42D0). Un unico call-site real: M7_FUN_80125808.
+static void hh_wrap_FUN_80004bb0(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t a0 = (uint32_t)ctx->r4, a1 = (uint32_t)ctx->r5;
+    auto r32 = [&](uint32_t a) -> uint32_t {
+        return *(uint32_t*)(rdram + ((a - 0x80000000u) & 0x7FFFFF));
+    };
+    static FILE* f = nullptr;
+    if (f == nullptr) f = fopen("hh_sched.log", "w");
+    if (f != nullptr) {
+        fprintf(f, "[SCHED] vi=%llu sample=%llu a0=%08X a1=%08X 42CC=%08X 42BC=%08X 42D0=%08X 42C8=%02X\n",
+                (unsigned long long)hh_get_vi_count(), (unsigned long long)hh_replay_get_sample(),
+                a0, a1, r32(0x8008D57C), r32(0x8008D56C), r32(0x8008D580), r32(0x8008D578) & 0xFF);
+        fflush(f);
+    }
+    hh_real_FUN_80004bb0(rdram, ctx);
+}
+// HH: dispatcher de una entrada temporizada (FUN_80004d20(handler=a0, target=a1)) y "add" del
+// scheduler (FUN_80004adc). Captura que handler se dispara (p.ej. la cadena 0x8021Bxxx del disable).
+static recomp_func_t* hh_real_FUN_80004d20 = nullptr;
+static recomp_func_t* hh_real_FUN_80004adc = nullptr;
+static void hh_scheddisp_log(const char* what, uint32_t handler, uint32_t target) {
+    static FILE* f = nullptr;
+    if (f == nullptr) f = fopen("hh_scheddisp.log", "w");
+    if (f == nullptr) return;
+    fprintf(f, "[DISP] vi=%llu sample=%llu %-8s handler=%08X target=%08X\n",
+            (unsigned long long)hh_get_vi_count(), (unsigned long long)hh_replay_get_sample(),
+            what, handler, target);
+    fflush(f);
+}
+static void hh_wrap_FUN_80004d20(uint8_t* rdram, recomp_context* ctx) {
+    hh_scheddisp_log("run", (uint32_t)ctx->r4, (uint32_t)ctx->r5);
+    hh_real_FUN_80004d20(rdram, ctx);
+}
+static void hh_wrap_FUN_80004adc(uint8_t* rdram, recomp_context* ctx) {
+    hh_scheddisp_log("add", (uint32_t)ctx->r4, (uint32_t)ctx->r5);
+    hh_real_FUN_80004adc(rdram, ctx);
+}
 static recomp_func_t* hh_real_FUN_80005270 = nullptr;
 static void hh_wrap_FUN_80005270(uint8_t* rdram, recomp_context* ctx) {
     auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
@@ -923,6 +996,65 @@ static void hh_wrap_FUN_801BF1CC(uint8_t* rdram, recomp_context* ctx) {
     fprintf(stderr, "[M23] FUN_801BF1CC a0=%08X a1=%08X\n", (unsigned)ctx->r4, (unsigned)ctx->r5);
     hh_real_FUN_801BF1CC(rdram, ctx);
 }
+// HH: contador de frames de juego (0x80001454) para comparar la cadencia del front-end port<->emu
+// (el port consume 1 muestra de replay por get_input; el emu ~1 muestra/VI en el front-end). Ver
+// notes/2026-09-19-inventario-y-nueva-evidencia-fase-previa.md.
+static std::atomic<uint64_t> hh_game_frame_count{0};
+extern "C" uint64_t hh_get_game_frame_count() { return hh_game_frame_count.load(); }
+// HH: callback del objeto de transicion 0x801D0474 (front-end). Mide su cadencia (VI) y el
+// registro de flancos de input [0x80089478] que lee via 801C1334. Gated por HH_LSTTRACE.
+static recomp_func_t* hh_real_FUN_801C1508 = nullptr;
+static void hh_wrap_FUN_801C1508(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_LSTTRACE") != nullptr) {
+        auto rh = [&](uint32_t a){ return (uint32_t)*(uint16_t*)&rdram[(a ^ 2) & 0x7FFFFF]; };
+        fprintf(stderr, "[CB1508] vi=%llu gframe=%llu f89478=%04X\n",
+            (unsigned long long)hh_get_vi_count(),
+            (unsigned long long)hh_get_game_frame_count(), rh(0x80089478));
+    }
+    hh_real_FUN_801C1508(rdram, ctx);
+}
+extern "C" unsigned long long hh_get_input_polls(void);
+// HH: wrapper directo del frame del bucle de juego (0x80001454) para medir su cadencia real
+// (frames/s y VI/frame) sin el posible doble conteo de get_function. Gated por HH_FRAMERATE.
+static recomp_func_t* hh_real_FUN_80001454 = nullptr;
+static void hh_wrap_FUN_80001454(uint8_t* rdram, recomp_context* ctx) {
+    const uint64_t n = hh_game_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (getenv("HH_FRAMERATE") != nullptr) {
+        // HH: los primeros 40 frames con VI, para ver dVI/frame (¿2 VI/frame como el original?).
+        if (n <= 40) {
+            fprintf(stderr, "[FRM] n=%llu vi=%llu in=%llu\n", (unsigned long long)n,
+                    (unsigned long long)hh_get_vi_count(), (unsigned long long)hh_get_input_polls());
+        }
+        static const auto t0 = std::chrono::steady_clock::now();
+        static auto last_log = t0;
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - last_log).count() >= 1.0) {
+            last_log = now;
+            fprintf(stderr, "[FRM] t=%.2f frame=%llu vi=%llu in=%llu\n",
+                    std::chrono::duration<double>(now - t0).count(), (unsigned long long)n,
+                    (unsigned long long)hh_get_vi_count(), (unsigned long long)hh_get_input_polls());
+        }
+    }
+    hh_real_FUN_80001454(rdram, ctx);
+}
+// HH: rama no-op del bucle principal (0x80001BB0), para medir el reparto frame/noop por iteracion.
+static recomp_func_t* hh_real_FUN_80001BB0 = nullptr;
+static void hh_wrap_FUN_80001BB0(uint8_t* rdram, recomp_context* ctx) {
+    if (getenv("HH_FRAMERATE") != nullptr) {
+        static const auto t0 = std::chrono::steady_clock::now();
+        static auto last_log = t0;
+        static uint64_t n = 0;
+        ++n;
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - last_log).count() >= 1.0) {
+            last_log = now;
+            fprintf(stderr, "[NOOP] t=%.2f n=%llu vi=%llu\n",
+                    std::chrono::duration<double>(now - t0).count(), (unsigned long long)n,
+                    (unsigned long long)hh_get_vi_count());
+        }
+    }
+    hh_real_FUN_80001BB0(rdram, ctx);
+}
 static recomp_func_t* hh_real_FUN_801C2050 = nullptr; // callback instalado en 0x801D0474 (transicion)
 static void hh_wrap_FUN_801C2050(uint8_t* rdram, recomp_context* ctx) {
     static uint64_t n = 0;
@@ -938,10 +1070,14 @@ static recomp_func_t* hh_real_FUN_80124C54 = nullptr; // callback del nodo 0x801
 static void hh_wrap_FUN_80124C54(uint8_t* rdram, recomp_context* ctx) {
     static uint64_t n = 0;
     if (n < 8 || (n % 500) == 0) {
-        fprintf(stderr, "[M23] FUN_80124C54 n=%llu a0=%08X a1=%08X bd6d=%02X bd6e=%02X bc1c=%04X\n",
-            (unsigned long long)n, (unsigned)ctx->r4, (unsigned)ctx->r5,
+        // 0x801BBD56 = byte que decide M7_FUN_8012FD1C (lbu 0x166 de 0x801BBBF0) -> 1 = seguir
+        // esperando la escena, 0 = fin de espera (transicion). Comparar port/emu en el mismo VI.
+        fprintf(stderr, "[M23] FUN_80124C54 n=%llu vi=%llu a0=%08X a1=%08X bd6d=%02X bd6e=%02X bc1c=%04X bd56=%02X\n",
+            (unsigned long long)n, (unsigned long long)hh_get_vi_count(),
+            (unsigned)ctx->r4, (unsigned)ctx->r5,
             (unsigned)rdram[(0x801BBD6D ^ 3) & 0x7FFFFF], (unsigned)rdram[(0x801BBD6E ^ 3) & 0x7FFFFF],
-            (unsigned)*(uint16_t*)&rdram[(0x801BBC1C ^ 2) & 0x7FFFFF]);
+            (unsigned)*(uint16_t*)&rdram[(0x801BBC1C ^ 2) & 0x7FFFFF],
+            (unsigned)rdram[(0x801BBD56 ^ 3) & 0x7FFFFF]);
     }
     n++;
     hh_real_FUN_80124C54(rdram, ctx);
@@ -949,10 +1085,13 @@ static void hh_wrap_FUN_80124C54(uint8_t* rdram, recomp_context* ctx) {
 static recomp_func_t* hh_real_FUN_8012FD1C = nullptr; // condicion que instala 80124CEC
 static void hh_wrap_FUN_8012FD1C(uint8_t* rdram, recomp_context* ctx) {
     uint32_t a0 = (uint32_t)ctx->r4;
+    // 0x801BBD56 = t6 leido por M7_FUN_8012fd28 (lbu 0x166 de 0x801BBBF0): decide la rama.
+    uint32_t t6 = (uint32_t)rdram[(0x801BBD56 ^ 3) & 0x7FFFFF];
     hh_real_FUN_8012FD1C(rdram, ctx);
     static int n = 0;
     if (n < 30 || ((n % 500) == 0 && (uint32_t)ctx->r2 != 0)) {
-        fprintf(stderr, "[M23] FUN_8012FD1C n=%d a0=%08X -> %08X\n", n, a0, (unsigned)ctx->r2);
+        fprintf(stderr, "[M23] FUN_8012FD1C n=%d vi=%llu a0=%08X t6=%u -> %08X\n", n,
+            (unsigned long long)hh_get_vi_count(), a0, t6, (unsigned)ctx->r2);
     }
     n++;
 }
@@ -1704,6 +1843,18 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
     }
     // HH: el loader de módulos debe registrar la sección recompilada en su base real SIEMPRE
     // (no solo en modo traza): soporta la reutilización de bases entre módulos.
+    if ((uint32_t)addr == 0x80001454) {
+        if (hh_real_FUN_80001454 == nullptr) {
+            hh_real_FUN_80001454 = func_find->second;
+        }
+        return hh_wrap_FUN_80001454;
+    }
+    if ((uint32_t)addr == 0x80001BB0) {
+        if (hh_real_FUN_80001BB0 == nullptr) {
+            hh_real_FUN_80001BB0 = func_find->second;
+        }
+        return hh_wrap_FUN_80001BB0;
+    }
     if ((uint32_t)addr == 0x80003824) {
         if (hh_real_FUN_80003824 == nullptr) {
             hh_real_FUN_80003824 = func_find->second;
@@ -1744,6 +1895,21 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
             hh_real_M24_FUN_801c0a30 = func_find->second;
         }
         return hh_wrap_M24_FUN_801c0a30;
+    }
+    // HH: traza de la cadena de callbacks del disable (gate HH_CHAINTRACE).
+    if (getenv("HH_CHAINTRACE") != nullptr) {
+        switch ((uint32_t)addr) {
+            case 0x8021B1A8: if (hh_real_M10_FUN_8021b1A8 == nullptr) hh_real_M10_FUN_8021b1A8 = func_find->second; return hh_wrap_M10_FUN_8021b1A8;
+            case 0x8021B200: if (hh_real_M10_FUN_8021b200 == nullptr) hh_real_M10_FUN_8021b200 = func_find->second; return hh_wrap_M10_FUN_8021b200;
+            case 0x8021B240: if (hh_real_M10_FUN_8021b240 == nullptr) hh_real_M10_FUN_8021b240 = func_find->second; return hh_wrap_M10_FUN_8021b240;
+            case 0x80004BB0: if (hh_real_FUN_80004bb0 == nullptr) hh_real_FUN_80004bb0 = func_find->second; return hh_wrap_FUN_80004bb0;
+            case 0x80004D20: if (hh_real_FUN_80004d20 == nullptr) hh_real_FUN_80004d20 = func_find->second; return hh_wrap_FUN_80004d20;
+            case 0x80004ADC: if (hh_real_FUN_80004adc == nullptr) hh_real_FUN_80004adc = func_find->second; return hh_wrap_FUN_80004adc;
+            case 0x80000A0C: if (hh_real_FUN_80000a0c == nullptr) hh_real_FUN_80000a0c = func_find->second; return hh_wrap_FUN_80000a0c;
+            case 0x80000934: if (hh_real_FUN_80000934 == nullptr) hh_real_FUN_80000934 = func_find->second; return hh_wrap_FUN_80000934;
+            case 0x80000984: if (hh_real_FUN_80000984 == nullptr) hh_real_FUN_80000984 = func_find->second; return hh_wrap_FUN_80000984;
+            default: break;
+        }
     }
     if (hh_tbltrace_on) {
         switch ((uint32_t)addr) {
@@ -1804,6 +1970,7 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
             case 0x801CBE88: if (hh_real_FUN_801CBE88 == nullptr) hh_real_FUN_801CBE88 = func_find->second; return hh_wrap_FUN_801CBE88;
             case 0x801CBDC0: if (hh_real_FUN_801CBDC0 == nullptr) hh_real_FUN_801CBDC0 = func_find->second; return hh_wrap_FUN_801CBDC0;
             case 0x801BF1CC: if (hh_real_FUN_801BF1CC == nullptr) hh_real_FUN_801BF1CC = func_find->second; return hh_wrap_FUN_801BF1CC;
+            case 0x801C1508: if (hh_real_FUN_801C1508 == nullptr) hh_real_FUN_801C1508 = func_find->second; return hh_wrap_FUN_801C1508;
             case 0x801C2050: if (hh_real_FUN_801C2050 == nullptr) hh_real_FUN_801C2050 = func_find->second; return hh_wrap_FUN_801C2050;
             case 0x80124C54: if (hh_real_FUN_80124C54 == nullptr) hh_real_FUN_80124C54 = func_find->second; return hh_wrap_FUN_80124C54;
             case 0x8012FD1C: if (hh_real_FUN_8012FD1C == nullptr) hh_real_FUN_8012FD1C = func_find->second; return hh_wrap_FUN_8012FD1C;
