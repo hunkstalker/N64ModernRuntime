@@ -810,6 +810,31 @@ static void hh_wrap_FUN_80003824(uint8_t* rdram, recomp_context* ctx) {
     }
     recomp::overlays::load_module_by_source(src, (int32_t)dst);
 }
+// HH: loader STREAMED FUN_80004838(id, dest): carga el fichero un trozo por llamada (su propio
+// descompresor 0x80003F44). El juego lo usa para el FICHERO 57 (combate), que se solapa con el 56
+// (exploracion) y NO pasa por FUN_80003824. Al completarse (r2 != 0) registramos el modulo en su
+// base. Sin esto, 0x80379410 resolvia a M55_FUN_80379410 (mid-funcion del 56) -> fuga de pila.
+// Ver notes/2026-09-20-nodo-8005bf14-origen-y-captura.md.
+static recomp_func_t* hh_real_FUN_80004838 = nullptr;
+static uint32_t hh_stream_id_to_src(uint32_t id) {
+    switch (id) {
+        case 57: return 0x69E416u; // .module56 (fichero 57, combate)
+        default: return 0;
+    }
+}
+static void hh_wrap_FUN_80004838(uint8_t* rdram, recomp_context* ctx) {
+    uint32_t id = (uint32_t)ctx->r4, dst = (uint32_t)ctx->r5;
+    hh_real_FUN_80004838(rdram, ctx);
+    if (ctx->r2 != 0) {
+        uint32_t src = hh_stream_id_to_src(id);
+        if (src != 0) {
+            if (getenv("HH_TBLTRACE") != nullptr) {
+                fprintf(stderr, "[STREAM] id=%u dst=%08X -> registrar src=%06X\n", id, dst, src);
+            }
+            recomp::overlays::load_module_by_source(src, (int32_t)dst);
+        }
+    }
+}
 // HH: cadena del nodo de boot: setter de callback (FUN_800058DC), dispatcher y pasos del
 // módulo 23 que deben avanzar 0x801CFE00/02.
 extern "C" int hh_get_callring(recomp_context* c, uint32_t* out, int max);
@@ -2102,6 +2127,13 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
             hh_real_FUN_80003824 = func_find->second;
         }
         return hh_wrap_FUN_80003824;
+    }
+    // HH: loader streamed (fichero 57, combate). SIEMPRE: registra el modulo al completarse.
+    if ((uint32_t)addr == 0x80004838) {
+        if (hh_real_FUN_80004838 == nullptr) {
+            hh_real_FUN_80004838 = func_find->second;
+        }
+        return hh_wrap_FUN_80004838;
     }
     // HH: el setter de callback FUN_800058dc se engancha SIEMPRE (barato: ~1400 llamadas). Si recibe
     // el veneno 0xFFFF84CD, vuelca la pila guest (quien dispara el disable) a hh_venom.log.

@@ -546,8 +546,7 @@ extern "C" void switch_error(const char* func, uint32_t vram, uint32_t jtbl) {
     exit(EXIT_FAILURE);
 }
 
-extern "C" void do_break(uint32_t vram) {
-    // TODO: properly handle break by restoring PC to caller and continuing.
+extern "C" void do_break(uint32_t vram) {    // TODO: properly handle break by restoring PC to caller and continuing.
     // For now, just warn and return to avoid killing the process.
     printf("do_break: unhandled break at original vram 0x%08X (ignored)\n", vram);
     // HH: registrar en fichero (dedup) los break/stubs ejecutados: un simbolo mal acotado queda en
@@ -564,6 +563,20 @@ extern "C" void do_break(uint32_t vram) {
                 fclose(f);
             }
         }
+    }
+}
+
+// HH: handler de `syscall` (N64Recomp emite `recomp_syscall_handler`). El modulo 56 (fichero 57,
+// combate) contiene palabras que el recompilador decodifica como `syscall` (probablemente datos
+// mal acotados). Stub: registra y continua. Si aparecen syscalls REALES en ejecucion, implementar.
+extern "C" void recomp_syscall_handler(uint8_t* rdram, recomp_context* ctx, int32_t instruction_vram) {
+    (void)rdram;
+    (void)ctx;
+    static std::unordered_set<uint32_t> seen;
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    if (seen.insert((uint32_t)instruction_vram).second) {
+        fprintf(stderr, "[SYSCALL] unhandled syscall at vram 0x%08X (ignored)\n", (uint32_t)instruction_vram);
     }
 }
 
