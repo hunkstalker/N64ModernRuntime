@@ -462,9 +462,9 @@ recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_p
 }
 
 extern "C" void osGetMemSize_recomp(uint8_t * rdram, recomp_context * ctx) {
-    // Hybrid Heaven's boot checks osGetMemSize() against 0x400000 (4MB) and enters an
-    // infinite wait loop otherwise. The retail game targets the base 4MB machine (no
-    // Expansion Pak), so report 4MB even though the runtime allocates 8MB.
+    // Hybrid Heaven's boot checks osGetMemSize() against 0x400000 (4MB). 4MB is the base retail
+    // machine (no Expansion Pak); the game takes its standard boot path. 8MB (Expansion Pak)
+    // probado como experimento: carga la Expansion Pak screen y crashea antes (no usar).
     (void)rdram;
     ctx->r2 = 4 * 1024 * 1024;
 }
@@ -1476,7 +1476,7 @@ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
     MEM_W(osTvType, 0) = 1; // NTSC
     MEM_W(osRomBase, 0) = 0xB0000000u; // standard rom base
     MEM_W(osResetType, 0) = 0; // cold reset
-    MEM_W(osMemSize, 0) = 4 * 1024 * 1024; // 4MB (base retail machine; see osGetMemSize_recomp)
+    MEM_W(osMemSize, 0) = 4 * 1024 * 1024; // 4MB (base retail machine)
 }
 
 std::u8string recomp::current_game_id() {

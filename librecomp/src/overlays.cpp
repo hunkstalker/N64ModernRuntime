@@ -294,7 +294,7 @@ void recomp::overlays::register_flat_code() {
         return false;
     };
     for (size_t section_index = 0; section_index < sections_info.num_code_sections; section_index++) {
-        if (is_relocatable(section_index)) {
+        if (getenv("HH_FLAT_ALL") == nullptr && is_relocatable(section_index)) {
             continue;
         }
         if (module_rom_addrs.count(sections_info.code_sections[section_index].rom_addr) != 0) {
