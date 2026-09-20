@@ -334,6 +334,32 @@ void load_overlay(size_t section_table_index, int32_t ram) {
 }
 
 // HH: registra la sección del módulo que corresponde al blob cargado (ver overlays.hpp).
+// HH: al cargar un modulo, desregistra cualquier seccion ya cargada que solape su base de RAM.
+// Los overlays del juego se solapan y se intercambian (p.ej. file_057 combate <-> file_056
+// exploracion; file_024 sobre la base de file_009); el mapa de funciones debe reflejar solo la
+// seccion vigente. Sin esto quedan entradas rancias que apuntan al codigo del fichero anterior.
+static void hh_unload_sections_overlapping(int32_t ram_addr, uint32_t size) {
+    const int64_t lo = (int64_t)ram_addr;
+    const int64_t hi = lo + (int64_t)size;
+    for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
+        const SectionTableEntry& section = sections_info.code_sections[it->section_table_index];
+        const int64_t slo = (int64_t)it->loaded_ram_addr;
+        const int64_t shi = slo + (int64_t)section.size;
+        if (lo < shi && slo < hi) {
+            hh_ovl_log("evict section=%zu ram=%08X (overlap with %08X+%X)\n",
+                       it->section_table_index, (unsigned)it->loaded_ram_addr,
+                       (unsigned)ram_addr, (unsigned)size);
+            for (size_t f = 0; f < section.num_funcs; f++) {
+                func_map.erase(it->loaded_ram_addr + section.funcs[f].offset);
+            }
+            section_addresses[section.index] = section.ram_addr;
+            it = loaded_sections.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void recomp::overlays::load_module_by_source(uint32_t src_rom, int32_t ram_addr) {
     auto it = module_sources.find(src_rom & 0x1FFFFFFFu);
     if (it == module_sources.end()) {
@@ -348,9 +374,12 @@ void recomp::overlays::load_module_by_source(uint32_t src_rom, int32_t ram_addr)
                 fprintf(stderr, "[OVL] src=%06X -> section[%zu] rom=%08X at %08X\n",
                         (unsigned)(src_rom & 0x1FFFFFFFu), i, (unsigned)it->second, (unsigned)ram_addr);
             }
-            // HH (revertido): se probó a desregistrar la sección anterior al reutilizar base, pero
-            // NO cambió el bloqueo de combate (misma cadena de módulo 23, mismo estado). Se restaura
-            // el comportamiento original para no dejar cambios no validados.
+            // HH: eviccion de la seccion que reutilizaba esta base (per-file: overlays que se
+            // intercambian). Revertir con HH_NO_EVICT=1 para A/B.
+            if (getenv("HH_NO_EVICT") == nullptr) {
+                hh_unload_sections_overlapping(ram_addr,
+                    sections_info.code_sections[i].size);
+            }
             load_overlay(i, ram_addr);
             return;
         }
