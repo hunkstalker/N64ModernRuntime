@@ -967,6 +967,60 @@ static void hh_dump_thread_rings(FILE* f) {
     }
 }
 
+// -------------------------------------------------------------------------------------
+// HH: vigilancia del NODO de la lista de suscriptores del event-dispatch. El nodo que se corrompe
+// (p.ej. 0x8005BF14, cola del bucle principal) vive en la PILA de un hilo, por lo que el watchpoint
+// por acceso (HH_WATCH_ADDR) da SEGV. Aqui, al registrar un nodo con hh_nodewatch_set (desde el
+// wrapper de FUN_80000934), se compara next/q una vez por VI y, si cambian, se vuelca la ventana de
+// llamadas de TODOS los hilos en el instante de la deteccion (candidato a autor del pisado).
+// -------------------------------------------------------------------------------------
+struct HhNodeWatch { uint32_t addr; uint32_t next; uint32_t q; };
+static HhNodeWatch hh_nodewatch[4];
+static int hh_nodewatch_n = 0;
+static FILE* hh_nodewatch_fp = nullptr;
+static long hh_nodewatch_lines = 0;
+
+extern "C" void hh_nodewatch_set(uint32_t addr) {
+    if (addr == 0) return;
+    for (int i = 0; i < hh_nodewatch_n; i++) if (hh_nodewatch[i].addr == addr) return;
+    if (hh_nodewatch_n >= 4) return;
+    uint8_t* rdram = hh_get_rdram_base();
+    if (rdram == nullptr) return;
+    uint32_t o = addr & 0x1FFFFFFFu;
+    if (o + 8 > 0x800000u) return;
+    HhNodeWatch& w = hh_nodewatch[hh_nodewatch_n++];
+    w.addr = addr;
+    w.next = *(uint32_t*)(rdram + o);
+    w.q = *(uint32_t*)(rdram + o + 4);
+    fprintf(stderr, "[NODEWATCH] vigilando node=%08X next=%08X q=%08X\n", addr, w.next, w.q);
+}
+
+static void hh_nodewatch_check(void) {
+    if (hh_nodewatch_n == 0) return;
+    uint8_t* rdram = hh_get_rdram_base();
+    if (rdram == nullptr) return;
+    uint64_t vi = hh_get_vi_count();
+    for (int i = 0; i < hh_nodewatch_n; i++) {
+        HhNodeWatch& w = hh_nodewatch[i];
+        uint32_t o = w.addr & 0x1FFFFFFFu;
+        if (o + 8 > 0x800000u) continue;
+        uint32_t next = *(uint32_t*)(rdram + o);
+        uint32_t q = *(uint32_t*)(rdram + o + 4);
+        if (next == w.next && q == w.q) continue;
+        if (hh_nodewatch_fp == nullptr) hh_nodewatch_fp = fopen("hh_nodewatch.log", "w");
+        FILE* f = hh_nodewatch_fp;
+        if (f != nullptr && hh_nodewatch_lines <= 50000) {
+            hh_nodewatch_lines++;
+            fprintf(f, "[NODEWATCH] vi=%llu node=%08X next=%08X->%08X q=%08X->%08X\n",
+                    (unsigned long long)vi, w.addr, w.next, next, w.q, q);
+            hh_dump_thread_rings(f);
+            fflush(f);
+        }
+        w.next = next;
+        w.q = q;
+    }
+}
+
 static bool hh_watched_hit(uint32_t guest_addr, uint32_t len) {
     if (hh_canary_n == 0 && hh_watch_active == 0) return false;
     uint32_t lo = guest_addr & 0x1FFFFFFFu;
@@ -1021,6 +1075,7 @@ extern "C" void hh_canary_init(void) {
 // Llamado una vez por VI desde el hilo VI (events.cpp). Compara las regiones vigiladas word a
 // word contra la sombra y loguea los cambios con la ventana de llamadas de cada hilo.
 extern "C" void hh_canary_tick(void) {
+    hh_nodewatch_check();
     if (hh_canary_n == 0) return;
     uint8_t* rdram = hh_get_rdram_base();
     if (rdram == nullptr) return;
@@ -1358,6 +1413,7 @@ extern "C" void hh_drwatch_init(uint8_t* rdram) { (void)rdram; }
 extern "C" int hh_direct_write(uint32_t, uint32_t, const char*) { return 0; }
 extern "C" void hh_canary_init(void) {}
 extern "C" void hh_canary_tick(void) {}
+extern "C" void hh_nodewatch_set(uint32_t) {}
 extern "C" void hh_drwatch_init(uint8_t*) {}
 extern "C" void hh_trace_init(void) {}
 extern "C" void hh_trace_fn(uint32_t) {}

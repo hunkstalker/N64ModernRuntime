@@ -661,15 +661,81 @@ static void hh_wrap_FUN_80124ed8(uint8_t* rdram, recomp_context* ctx) {
 static recomp_func_t* hh_real_FUN_80000a0c = nullptr; // broadcast a todos los nodos
 static recomp_func_t* hh_real_FUN_80000934 = nullptr; // push request node
 static recomp_func_t* hh_real_FUN_80000984 = nullptr; // pop request node
+extern "C" void hh_nodewatch_set(uint32_t addr);
+extern "C" recomp_context* hh_get_current_ctx(void);
+extern "C" int hh_get_callring(recomp_context* c, uint32_t* out, int max);
 static int hh_tid(uint8_t* rdram) {
     PTR(OSThread) t = ultramodern::this_thread();
     return t == NULLPTR ? -1 : (int)TO_PTR(OSThread, t)->id;
 }
+// HH: valida que `q` sea una OSMesgQueue plausible (validCount/first/msgCount coherentes). Sirve para
+// marcar el PRIMER nodo corrupto de la lista de suscriptores sin depender del envio (BADMQ).
+static bool hh_q_ok(uint8_t* rdram, uint32_t q) {
+    if ((q & 3u) != 0 || q < 0x80040000u || q >= 0x80200000u) return false;
+    uint32_t o = q & 0x1FFFFFFFu;
+    if (o + 0x18 > 0x800000u) return false;
+    int32_t valid = *(int32_t*)(rdram + o + 8);
+    int32_t first = *(int32_t*)(rdram + o + 0xC);
+    int32_t msgCount = *(int32_t*)(rdram + o + 0x10);
+    uint32_t msg = *(uint32_t*)(rdram + o + 0x14);
+    if (msgCount < 1 || msgCount > 0x1000) return false;
+    if (valid < 0 || valid > msgCount) return false;
+    if (first < 0 || first >= msgCount) return false;
+    if (msg < 0x80000000u || msg >= 0x80800000u) return false;
+    return true;
+}
+static int hh_bcorrupt_seen[16];
+static int hh_bcorrupt_n = 0;
 static void hh_wrap_FUN_80000a0c(uint8_t* rdram, recomp_context* ctx) {
     auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x1FFFFFFF]; };
     static uint64_t hh_n = 0;
     uint32_t obj = (uint32_t)ctx->r4, msg = (uint32_t)ctx->r5;
     uint32_t head = r32(obj + 0x888);
+    // HH: recorre la lista (acotada) guardando el camino; detecta puntero/cola invalidos o CICLO.
+    // Si hay problema, vuelca el camino completo (nodos + q) una vez por head.
+    {
+        uint32_t path[64];
+        uint32_t pnext[64];
+        uint32_t pq[64];
+        int plen = 0;
+        bool bad = false;
+        uint32_t n = head;
+        for (int i = 0; n != 0 && i < 64; i++) {
+            bool node_ok = (n & 3u) == 0 && n >= 0x80040000u && n < 0x80800000u;
+            if (!node_ok) { bad = true; path[plen] = n; pnext[plen] = 0; pq[plen] = 0; plen++; break; }
+            for (int k = 0; k < plen; k++) if (path[k] == n) { bad = true; break; }
+            if (bad) break;
+            uint32_t q = r32(n + 4);
+            path[plen] = n; pnext[plen] = r32(n); pq[plen] = q; plen++;
+            if (!hh_q_ok(rdram, q)) { bad = true; break; }
+            n = r32(n);
+        }
+        if (plen > 8) bad = true;
+        if (bad) {
+            bool seen = false;
+            for (int k = 0; k < hh_bcorrupt_n; k++) if (hh_bcorrupt_seen[k] == (int)head) { seen = true; break; }
+            if (!seen && hh_bcorrupt_n < 16) hh_bcorrupt_seen[hh_bcorrupt_n++] = (int)head;
+            if (!seen) {
+                FILE* f = fopen("hh_bcorrupt.log", "a");
+                if (f != nullptr) {
+                    uint32_t ring[16];
+                    recomp_context* c = hh_get_current_ctx();
+                    int rn = c ? hh_get_callring(c, ring, 16) : 0;
+                    fprintf(f, "[BCORRUPT] n=%llu tid=%d obj=%08X msg=%08X head=%08X plen=%d sp=%08X\n",
+                            (unsigned long long)hh_n, hh_tid(rdram), obj, msg, head, plen,
+                            c ? (uint32_t)c->r29 : 0);
+                    for (int k = 0; k < plen; k++)
+                        fprintf(f, "      [%d] node=%08X next=%08X q=%08X qok=%d\n",
+                                k, path[k], pnext[k], pq[k], hh_q_ok(rdram, pq[k]));
+                    fprintf(f, "      last:");
+                    for (int k = 0; k < rn; k++) fprintf(f, " %08X", ring[k]);
+                    fprintf(f, "\n");
+                    fflush(f);
+                    fclose(f);
+                }
+            }
+        }
+    }
     if (hh_n < 10 || (hh_n % 200) == 0) {
         fprintf(stderr, "[BCAST] n=%llu tid=%d obj=%08X msg=%08X head=%08X", (unsigned long long)hh_n, hh_tid(rdram), obj, msg, head);
         for (uint32_t n = head, i = 0; n != 0 && i < 8; n = r32(n), i++) {
@@ -684,6 +750,7 @@ static void hh_wrap_FUN_80000934(uint8_t* rdram, recomp_context* ctx) {
     auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x1FFFFFFF]; };
     uint32_t obj = (uint32_t)ctx->r4, node = (uint32_t)ctx->r5, q = (uint32_t)ctx->r6;
     fprintf(stderr, "[PUSH] tid=%d obj=%08X node=%08X q=%08X oldhead=%08X\n", hh_tid(rdram), obj, node, q, r32(obj + 0x888));
+    if (obj == 0x8005C4B0 && (q == 0x8005C288u || q == 0x80091DA0u)) hh_nodewatch_set(node);
     hh_real_FUN_80000934(rdram, ctx);
 }
 static void hh_wrap_FUN_80000984(uint8_t* rdram, recomp_context* ctx) {
@@ -746,6 +813,8 @@ static void hh_wrap_FUN_80003824(uint8_t* rdram, recomp_context* ctx) {
 // HH: cadena del nodo de boot: setter de callback (FUN_800058DC), dispatcher y pasos del
 // módulo 23 que deben avanzar 0x801CFE00/02.
 extern "C" int hh_get_callring(recomp_context* c, uint32_t* out, int max);
+// HH: historial largo de llamadas (hh_ring2, por hilo) para ver la recursion/reentrada de la cadena.
+extern "C" void hh_ring2_dump_last(FILE* f, int count);
 // HH: al ver el veneno 0xFFFF84CD/0xFF7F84CD en a1, volcar la PILA GUEST (cadena de retornos) y el
 // anillo de llamadas a hh_venom.log. Es la via barata (solo el setter, ~1400 llamadas) para localizar
 // quien dispara el disable. OJO: comparar truncando a 32 bits. ADD32 firma-extiende a 64 bits
@@ -756,7 +825,7 @@ static void hh_dump_venom(const char* tag, uint8_t* rdram, recomp_context* ctx) 
     static FILE* vf = nullptr;
     static int vn = 0;
     if (vf == nullptr) vf = fopen("hh_venom.log", "w");
-    if (vf == nullptr || vn >= 12) return;
+    if (vf == nullptr || vn >= 64) return;
     vn++;
     uint32_t sp = (uint32_t)ctx->r29;
     uint32_t a0 = (uint32_t)ctx->r4, a2 = (uint32_t)ctx->r6, a3 = (uint32_t)ctx->r7;
@@ -780,6 +849,10 @@ static void hh_dump_venom(const char* tag, uint8_t* rdram, recomp_context* ctx) 
         for (int k = 0; k < rn; k++) fprintf(vf, " %08X", ring[k]);
         fprintf(vf, "\n");
     }
+    // HH: historial largo del hilo actual (hasta 512 entradas) para ver la recursion/reentrada de la
+    // cadena del disable (los 12 venenos tienen sp a +0x58). Formato: "target sp" por linea.
+    fprintf(vf, "  ring2-last512:\n");
+    hh_ring2_dump_last(vf, 512);
     fflush(vf);
 }
 static recomp_func_t* hh_real_FUN_800058dc = nullptr;
@@ -931,6 +1004,130 @@ static void hh_wrap_M10_FUN_8021b240(uint8_t* rdram, recomp_context* ctx) {
     hh_real_M10_FUN_8021b240(rdram, ctx);
     hh_chain_log("b240-out", a0, a1, (uint32_t)ctx->r2);
 }
+// HH: instalador del disable (M10_FUN_8021b280). Mide la REINVOCACION: profundidad por hilo
+// (thread_local) y contador por objeto. Si la cadena se reinvoca en bucle, aqui se ve (depth crece
+// o el mismo obj se cuenta N veces). Salida: hh_b280call.log. Gate: HH_CHAINTRACE.
+static recomp_func_t* hh_real_M10_FUN_8021b280 = nullptr;
+static thread_local int hh_b280_depth = 0;
+struct HhB280Count { uint32_t obj; uint32_t n; };
+static HhB280Count hh_b280_cnt[16];
+static int hh_b280_cnt_n = 0;
+static void hh_b280_count(uint32_t obj) {
+    for (int i = 0; i < hh_b280_cnt_n; i++) {
+        if (hh_b280_cnt[i].obj == obj) { hh_b280_cnt[i].n++; return; }
+    }
+    if (hh_b280_cnt_n < 16) {
+        hh_b280_cnt[hh_b280_cnt_n].obj = obj;
+        hh_b280_cnt[hh_b280_cnt_n].n = 1;
+        hh_b280_cnt_n++;
+    }
+}
+static void hh_wrap_M10_FUN_8021b280(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t obj = (uint32_t)ctx->r4, a1 = (uint32_t)ctx->r5;
+    hh_b280_count(obj);
+    const int d = ++hh_b280_depth;
+    static FILE* f = nullptr;
+    static long n = 0;
+    if (f == nullptr) f = fopen("hh_b280call.log", "w");
+    if (f != nullptr && n < 500000) {
+        n++;
+        uint32_t cnt = 0;
+        for (int i = 0; i < hh_b280_cnt_n; i++)
+            if (hh_b280_cnt[i].obj == obj) { cnt = hh_b280_cnt[i].n; break; }
+        fprintf(f, "[B280CALL] n=%ld vi=%llu tid=%d depth=%d obj=%08X a1=%08X sp=%08X ra=%08X objcount=%u\n",
+                n, (unsigned long long)hh_get_vi_count(), hh_tid(rdram), d, obj, a1,
+                (uint32_t)ctx->r29, (uint32_t)ctx->r31, cnt);
+        fflush(f);
+    }
+    hh_real_M10_FUN_8021b280(rdram, ctx);
+    hh_b280_depth = d - 1;
+}
+// HH: detector de FUGA DE PILA (desbalance de sp) por funcion. Se wrapean las funciones del driver/
+// cadena del disable (las del anillo del veneno). Si una funcion retorna con sp != entry, lo loguea
+// a hh_spchk.log con el delta. La deriva observada es +0x58 por frame: aqui se localiza quien la
+// causa. Gate: HH_CHAINTRACE.
+static FILE* hh_spchk_fp = nullptr;
+static void hh_spchk_log(const char* name, uint32_t sp0, uint32_t sp1, uint32_t ra) {
+    if (sp0 == sp1 || sp0 == 0) return;
+    if (hh_spchk_fp == nullptr) hh_spchk_fp = fopen("hh_spchk.log", "w");
+    if (hh_spchk_fp == nullptr) return;
+    fprintf(hh_spchk_fp, "[SPCHK] %-24s entry=%08X exit=%08X delta=%+d ra=%08X\n",
+            name, sp0, sp1, (int)(sp1 - sp0), ra);
+    fflush(hh_spchk_fp);
+}
+#define HH_SPCHK(NAME) \
+    static recomp_func_t* hh_real_##NAME = nullptr; \
+    static void hh_wrap_##NAME(uint8_t* rdram, recomp_context* ctx) { \
+        uint32_t s0 = (uint32_t)ctx->r29; \
+        hh_real_##NAME(rdram, ctx); \
+        hh_spchk_log(#NAME, s0, (uint32_t)ctx->r29, (uint32_t)ctx->r31); \
+    }
+HH_SPCHK(FUN_80006214)
+HH_SPCHK(FUN_8001f718)
+HH_SPCHK(M7_FUN_801277b0)
+HH_SPCHK(M7_FUN_8012c9c0)
+HH_SPCHK(M7_FUN_8012ce10)
+HH_SPCHK(M7_FUN_8012b1e4)
+HH_SPCHK(M7_FUN_8012bfa0)
+HH_SPCHK(M10_FUN_8022c7a4)
+HH_SPCHK(M10_FUN_8022c5ac)
+HH_SPCHK(M10_FUN_8022c314)
+HH_SPCHK(M10_FUN_8022c478)
+// HH: `FUN_80001454` (frame) y `FUN_80001BB0` (no-op) ya tienen wrapper propio (más abajo).
+HH_SPCHK(FUN_8000290C)
+// HH: llamantes directos de FUN_80001454 (frame) — para localizar la fuga 0x58/frame del hilo 5.
+HH_SPCHK(FUN_80000ec8)
+HH_SPCHK(FUN_80001060)
+HH_SPCHK(FUN_80001b30)
+HH_SPCHK(FUN_80001bc0)
+HH_SPCHK(FUN_80001d5c)
+HH_SPCHK(FUN_800021b4)
+HH_SPCHK(FUN_8000433c)
+HH_SPCHK(FUN_80006790)
+HH_SPCHK(FUN_80006af0)
+HH_SPCHK(FUN_8001e978)
+HH_SPCHK(FUN_8001eaa4)
+HH_SPCHK(FUN_80026e58)
+HH_SPCHK(FUN_80026f58)
+HH_SPCHK(FUN_80029fa0)
+HH_SPCHK(FUN_80032890)
+HH_SPCHK(FUN_80034ab8)
+HH_SPCHK(FUN_80034c24)
+HH_SPCHK(M7_FUN_80126744)
+HH_SPCHK(M7_FUN_80126944)
+HH_SPCHK(FUN_8012fe50)
+HH_SPCHK(FUN_80133aa0)
+HH_SPCHK(FUN_8001f76c)
+// HH: FIX de la fuga de pila del cluster M55 (0x80379410/424/444/464). En ROM son mid-entries (sin
+// prologo -0x58) del contenedor M55_FUN_80379244, con epilogo COMPARTIDO 0x8037948C (sp += 0x58).
+// El fallthrough interno (0x80379244 -> directo) NO pasa por get_function/wrappers; las entradas
+// EXTERNAS (jal desde M10, o callback via FUN_80005270 `jalr [obj+0x18]`) si, y retornan con sp
+// +0x58 (fuga/frame -> pisa FUN_800011b0 / nodo 0x8005BF14). Con HH_M55SPFIX=1 se restaura sp.
+// NO se envuelve el epilogo 0x8037948C (rompería el camino interno).
+// Ver notes/2026-09-20-nodo-8005bf14-origen-y-captura.md §10.
+#define HH_M55SPFIX_WRAP(NAME) \
+    static recomp_func_t* hh_real_##NAME = nullptr; \
+    static void hh_wrap_##NAME(uint8_t* rdram, recomp_context* ctx) { \
+        uint32_t s0 = (uint32_t)ctx->r29; \
+        hh_real_##NAME(rdram, ctx); \
+        hh_spchk_log(#NAME, s0, (uint32_t)ctx->r29, (uint32_t)ctx->r31); \
+        if (getenv("HH_M55SPFIX") != nullptr) { \
+            static FILE* f = nullptr; \
+            static long n = 0; \
+            if (f == nullptr) f = fopen("hh_m55spfix.log", "w"); \
+            if (f != nullptr && n < 500000) { \
+                n++; \
+                fprintf(f, "[M55SPFIX] %s n=%ld vi=%llu sp=%08X->%08X (restaurado)\n", \
+                        #NAME, n, (unsigned long long)hh_get_vi_count(), s0, (uint32_t)ctx->r29); \
+                fflush(f); \
+            } \
+            ctx->r29 = s0; \
+        } \
+    }
+HH_M55SPFIX_WRAP(M55_FUN_80379410)
+HH_M55SPFIX_WRAP(M55_FUN_80379424)
+HH_M55SPFIX_WRAP(M55_FUN_80379444)
+HH_M55SPFIX_WRAP(M55_FUN_80379464)
 // HH: scheduler de eventos temporizados (FUN_80004bb0). Loguea a0 (id), a1 y los tiempos que
 // gobiernan el disparo (0x42CC/0x42BC/0x42D0). Un unico call-site real: M7_FUN_80125808.
 static void hh_wrap_FUN_80004bb0(uint8_t* rdram, recomp_context* ctx) {
@@ -981,6 +1178,46 @@ static void hh_wrap_FUN_80005270(uint8_t* rdram, recomp_context* ctx) {
     }
     hh_real_FUN_80005270(rdram, ctx);
 }
+// HH: balance de sp del dispatcher (hereda la fuga si el callback es un mid-entry M55 sin arreglar).
+// Loguea los callbacks de objeto que despacha ([listhead+0x18/0x1C/0x20]) para identificar el que fuga.
+static void hh_wrap_FUN_80005270_spchk(uint8_t* rdram, recomp_context* ctx) {
+    uint32_t s0 = (uint32_t)ctx->r29;
+    auto r32 = [&](uint32_t a){ return *(uint32_t*)&rdram[a & 0x7FFFFF]; };
+    if (getenv("HH_M55SPFIX") != nullptr) {
+        static FILE* f = nullptr;
+        static long n = 0;
+        if (f == nullptr) f = fopen("hh_disp.log", "w");
+        if (f != nullptr && n < 4000) {
+            n++;
+            uint32_t head = r32(0x80089378);
+            fprintf(f, "[DISP] n=%ld vi=%llu a0=%08X head=%08X", n,
+                    (unsigned long long)hh_get_vi_count(), (uint32_t)ctx->r4, head);
+            uint32_t it = head;
+            for (int i = 0; i < 4 && it != 0; i++, it = r32(it)) {
+                fprintf(f, " [%08X 18=%08X 1C=%08X 20=%08X]", it,
+                        r32(it + 0x18), r32(it + 0x1C), r32(it + 0x20));
+            }
+            fprintf(f, "\n");
+            fflush(f);
+        }
+    }
+    hh_real_FUN_80005270(rdram, ctx);
+    hh_spchk_log("FUN_80005270", s0, (uint32_t)ctx->r29, (uint32_t)ctx->r31);
+    // HH: el dispatcher debe tener neto sp=0 (prologo -0x40 / epilogo +0x40). La fuga +0x58 viene del
+    // callback (`jalr [obj+0x18/0x1C/0x20]`, mid-entry sin prologo). Restauramos sp para neutralizarla.
+    if (getenv("HH_M55SPFIX") != nullptr && (uint32_t)ctx->r29 != s0) {
+        static FILE* f = nullptr;
+        static long n = 0;
+        if (f == nullptr) f = fopen("hh_m55spfix.log", "a");
+        if (f != nullptr && n < 500000) {
+            n++;
+            fprintf(f, "[DISP-SPFIX] n=%ld vi=%llu sp=%08X->%08X (restaurado)\n",
+                    n, (unsigned long long)hh_get_vi_count(), s0, (uint32_t)ctx->r29);
+            fflush(f);
+        }
+        ctx->r29 = s0;
+    }
+}
 static recomp_func_t* hh_real_FUN_801CBE88 = nullptr;
 static void hh_wrap_FUN_801CBE88(uint8_t* rdram, recomp_context* ctx) {
     fprintf(stderr, "[M23] FUN_801CBE88 a0=%08X a1=%08X\n", (unsigned)ctx->r4, (unsigned)ctx->r5);
@@ -1018,6 +1255,7 @@ extern "C" unsigned long long hh_get_input_polls(void);
 // (frames/s y VI/frame) sin el posible doble conteo de get_function. Gated por HH_FRAMERATE.
 static recomp_func_t* hh_real_FUN_80001454 = nullptr;
 static void hh_wrap_FUN_80001454(uint8_t* rdram, recomp_context* ctx) {
+    const uint32_t s0 = (uint32_t)ctx->r29;
     const uint64_t n = hh_game_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (getenv("HH_FRAMERATE") != nullptr) {
         // HH: los primeros 40 frames con VI, para ver dVI/frame (¿2 VI/frame como el original?).
@@ -1036,6 +1274,7 @@ static void hh_wrap_FUN_80001454(uint8_t* rdram, recomp_context* ctx) {
         }
     }
     hh_real_FUN_80001454(rdram, ctx);
+    hh_spchk_log("FUN_80001454", s0, (uint32_t)ctx->r29, (uint32_t)ctx->r31);
 }
 // HH: rama no-op del bucle principal (0x80001BB0), para medir el reparto frame/noop por iteracion.
 static recomp_func_t* hh_real_FUN_80001BB0 = nullptr;
@@ -1697,8 +1936,11 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
             fflush(df);
         }
     }
-    // HH: registrar (target, sp) de cada llamada para diagnosticar hundimientos de pila.
-    if (hh_watch_active) {
+    // HH: registrar (target, sp) de cada llamada para diagnosticar hundimientos de pila. El anillo
+    // grande (hh_ring2) se activa con HH_WATCH_ADDR o HH_CHAINTRACE (historial largo del veneno).
+    static const bool hh_ring2_on = (getenv("HH_WATCH_ADDR") != nullptr) ||
+                                    (getenv("HH_CHAINTRACE") != nullptr);
+    if (hh_watch_active || hh_ring2_on) {
         recomp_context* hh_c = hh_get_current_ctx();
         uint32_t hh_sp = hh_c != nullptr ? (uint32_t)hh_c->r29 : 0;
         hh_ring_record((uint32_t)addr, hh_sp);
@@ -1902,6 +2144,48 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
             case 0x8021B1A8: if (hh_real_M10_FUN_8021b1A8 == nullptr) hh_real_M10_FUN_8021b1A8 = func_find->second; return hh_wrap_M10_FUN_8021b1A8;
             case 0x8021B200: if (hh_real_M10_FUN_8021b200 == nullptr) hh_real_M10_FUN_8021b200 = func_find->second; return hh_wrap_M10_FUN_8021b200;
             case 0x8021B240: if (hh_real_M10_FUN_8021b240 == nullptr) hh_real_M10_FUN_8021b240 = func_find->second; return hh_wrap_M10_FUN_8021b240;
+            case 0x8021B280: if (hh_real_M10_FUN_8021b280 == nullptr) hh_real_M10_FUN_8021b280 = func_find->second; return hh_wrap_M10_FUN_8021b280;
+            case 0x80006214: if (hh_real_FUN_80006214 == nullptr) hh_real_FUN_80006214 = func_find->second; return hh_wrap_FUN_80006214;
+            case 0x8001F718: if (hh_real_FUN_8001f718 == nullptr) hh_real_FUN_8001f718 = func_find->second; return hh_wrap_FUN_8001f718;
+            case 0x8001F76C: if (hh_real_FUN_8001f76c == nullptr) hh_real_FUN_8001f76c = func_find->second; return hh_wrap_FUN_8001f76c;
+            case 0x801277B0: if (hh_real_M7_FUN_801277b0 == nullptr) hh_real_M7_FUN_801277b0 = func_find->second; return hh_wrap_M7_FUN_801277b0;
+            case 0x8012C9C0: if (hh_real_M7_FUN_8012c9c0 == nullptr) hh_real_M7_FUN_8012c9c0 = func_find->second; return hh_wrap_M7_FUN_8012c9c0;
+            case 0x8012CE10: if (hh_real_M7_FUN_8012ce10 == nullptr) hh_real_M7_FUN_8012ce10 = func_find->second; return hh_wrap_M7_FUN_8012ce10;
+            case 0x8012B1E4: if (hh_real_M7_FUN_8012b1e4 == nullptr) hh_real_M7_FUN_8012b1e4 = func_find->second; return hh_wrap_M7_FUN_8012b1e4;
+            case 0x8012BFA0: if (hh_real_M7_FUN_8012bfa0 == nullptr) hh_real_M7_FUN_8012bfa0 = func_find->second; return hh_wrap_M7_FUN_8012bfa0;
+            case 0x80379410: if (hh_real_M55_FUN_80379410 == nullptr) hh_real_M55_FUN_80379410 = func_find->second; return hh_wrap_M55_FUN_80379410;
+            case 0x80379424: if (hh_real_M55_FUN_80379424 == nullptr) hh_real_M55_FUN_80379424 = func_find->second; return hh_wrap_M55_FUN_80379424;
+            case 0x80379444: if (hh_real_M55_FUN_80379444 == nullptr) hh_real_M55_FUN_80379444 = func_find->second; return hh_wrap_M55_FUN_80379444;
+            case 0x80379464: if (hh_real_M55_FUN_80379464 == nullptr) hh_real_M55_FUN_80379464 = func_find->second; return hh_wrap_M55_FUN_80379464;
+            case 0x8022C7A4: if (hh_real_M10_FUN_8022c7a4 == nullptr) hh_real_M10_FUN_8022c7a4 = func_find->second; return hh_wrap_M10_FUN_8022c7a4;
+            case 0x8022C5AC: if (hh_real_M10_FUN_8022c5ac == nullptr) hh_real_M10_FUN_8022c5ac = func_find->second; return hh_wrap_M10_FUN_8022c5ac;
+            case 0x8022C314: if (hh_real_M10_FUN_8022c314 == nullptr) hh_real_M10_FUN_8022c314 = func_find->second; return hh_wrap_M10_FUN_8022c314;
+            case 0x8022C478: if (hh_real_M10_FUN_8022c478 == nullptr) hh_real_M10_FUN_8022c478 = func_find->second; return hh_wrap_M10_FUN_8022c478;
+            case 0x80001454: if (hh_real_FUN_80001454 == nullptr) hh_real_FUN_80001454 = func_find->second; return hh_wrap_FUN_80001454;
+            case 0x8000290C: if (hh_real_FUN_8000290C == nullptr) hh_real_FUN_8000290C = func_find->second; return hh_wrap_FUN_8000290C;
+            case 0x80001BB0: if (hh_real_FUN_80001BB0 == nullptr) hh_real_FUN_80001BB0 = func_find->second; return hh_wrap_FUN_80001BB0;
+            case 0x80000EC8: if (hh_real_FUN_80000ec8 == nullptr) hh_real_FUN_80000ec8 = func_find->second; return hh_wrap_FUN_80000ec8;
+            case 0x80005270: if (hh_real_FUN_80005270 == nullptr) hh_real_FUN_80005270 = func_find->second; return hh_wrap_FUN_80005270_spchk;
+            case 0x80001060: if (hh_real_FUN_80001060 == nullptr) hh_real_FUN_80001060 = func_find->second; return hh_wrap_FUN_80001060;
+            case 0x80001B30: if (hh_real_FUN_80001b30 == nullptr) hh_real_FUN_80001b30 = func_find->second; return hh_wrap_FUN_80001b30;
+            case 0x80001BC0: if (hh_real_FUN_80001bc0 == nullptr) hh_real_FUN_80001bc0 = func_find->second; return hh_wrap_FUN_80001bc0;
+            case 0x80001D5C: if (hh_real_FUN_80001d5c == nullptr) hh_real_FUN_80001d5c = func_find->second; return hh_wrap_FUN_80001d5c;
+            case 0x800021B4: if (hh_real_FUN_800021b4 == nullptr) hh_real_FUN_800021b4 = func_find->second; return hh_wrap_FUN_800021b4;
+            case 0x8000433C: if (hh_real_FUN_8000433c == nullptr) hh_real_FUN_8000433c = func_find->second; return hh_wrap_FUN_8000433c;
+            case 0x80006790: if (hh_real_FUN_80006790 == nullptr) hh_real_FUN_80006790 = func_find->second; return hh_wrap_FUN_80006790;
+            case 0x80006AF0: if (hh_real_FUN_80006af0 == nullptr) hh_real_FUN_80006af0 = func_find->second; return hh_wrap_FUN_80006af0;
+            case 0x8001E978: if (hh_real_FUN_8001e978 == nullptr) hh_real_FUN_8001e978 = func_find->second; return hh_wrap_FUN_8001e978;
+            case 0x8001EAA4: if (hh_real_FUN_8001eaa4 == nullptr) hh_real_FUN_8001eaa4 = func_find->second; return hh_wrap_FUN_8001eaa4;
+            case 0x80026E58: if (hh_real_FUN_80026e58 == nullptr) hh_real_FUN_80026e58 = func_find->second; return hh_wrap_FUN_80026e58;
+            case 0x80026F58: if (hh_real_FUN_80026f58 == nullptr) hh_real_FUN_80026f58 = func_find->second; return hh_wrap_FUN_80026f58;
+            case 0x80029FA0: if (hh_real_FUN_80029fa0 == nullptr) hh_real_FUN_80029fa0 = func_find->second; return hh_wrap_FUN_80029fa0;
+            case 0x80032890: if (hh_real_FUN_80032890 == nullptr) hh_real_FUN_80032890 = func_find->second; return hh_wrap_FUN_80032890;
+            case 0x80034AB8: if (hh_real_FUN_80034ab8 == nullptr) hh_real_FUN_80034ab8 = func_find->second; return hh_wrap_FUN_80034ab8;
+            case 0x80034C24: if (hh_real_FUN_80034c24 == nullptr) hh_real_FUN_80034c24 = func_find->second; return hh_wrap_FUN_80034c24;
+            case 0x80126744: if (hh_real_M7_FUN_80126744 == nullptr) hh_real_M7_FUN_80126744 = func_find->second; return hh_wrap_M7_FUN_80126744;
+            case 0x80126944: if (hh_real_M7_FUN_80126944 == nullptr) hh_real_M7_FUN_80126944 = func_find->second; return hh_wrap_M7_FUN_80126944;
+            case 0x8012FE50: if (hh_real_FUN_8012fe50 == nullptr) hh_real_FUN_8012fe50 = func_find->second; return hh_wrap_FUN_8012fe50;
+            case 0x80133AA0: if (hh_real_FUN_80133aa0 == nullptr) hh_real_FUN_80133aa0 = func_find->second; return hh_wrap_FUN_80133aa0;
             case 0x80004BB0: if (hh_real_FUN_80004bb0 == nullptr) hh_real_FUN_80004bb0 = func_find->second; return hh_wrap_FUN_80004bb0;
             case 0x80004D20: if (hh_real_FUN_80004d20 == nullptr) hh_real_FUN_80004d20 = func_find->second; return hh_wrap_FUN_80004d20;
             case 0x80004ADC: if (hh_real_FUN_80004adc == nullptr) hh_real_FUN_80004adc = func_find->second; return hh_wrap_FUN_80004adc;
