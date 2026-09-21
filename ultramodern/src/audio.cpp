@@ -195,7 +195,16 @@ uint32_t ultramodern::get_remaining_audio_bytes() {
             left = 0.0;
         }
         const uint32_t frames = (uint32_t)(left * (double)sample_rate + 0.5);
-        return frames * 2 * sizeof(int16_t);
+        // HH: sesgo de sintonizacion (frames) del reporte. El driver del juego calcula el siguiente
+        // tamano con este valor; un sesgo corrige la sobreproduccion (~6% medido con FIFO) SIN
+        // resamplear/pitch. `HH_AI_LEN_OFFSET` (default 0 = fiel). Ver notes/2026-09-17 §5c/§5d.
+        static const int32_t hh_len_off = [] {
+            const char* e = getenv("HH_AI_LEN_OFFSET");
+            return (e != nullptr && *e != '\0') ? (int32_t)strtol(e, nullptr, 10) : 0;
+        }();
+        int64_t f = (int64_t)frames + hh_len_off;
+        if (f < 0) f = 0;
+        return (uint32_t)f * 2 * sizeof(int16_t);
     }
     // Get the number of remaining buffered audio bytes.
     uint32_t buffered_byte_count;
