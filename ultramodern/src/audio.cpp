@@ -186,15 +186,14 @@ uint32_t ultramodern::get_remaining_audio_bytes() {
     if (hh_ai_fifo_enabled()) {
         // Hardware: lo que queda del DMA ACTUAL (el driver calcula el siguiente tamano con esto).
         hh_ai_advance();
-        // HH (experimento, opt-in): modelo de la REFERENCIA en vez del restante del FIFO. Reportar
-        // la COLAP REAL del dispositivo (en frames del juego) menos un headroom. El juego dimensiona
+        // HH: modelo de la REFERENCIA (por defecto; `HH_AI_REPORT_SDL=0` revierte al FIFO). Reportar
+        // la COLA REAL del dispositivo (en frames del juego) menos un headroom. El juego dimensiona
         // cada buffer con esto -> la cola se asienta en el headroom y NO crece (evita la
-        // sobreproduccion y los descartes del watermark). `HH_AI_REPORT_SDL=1`, `HH_AI_HEADROOM_MS`
-        // (30). El FIFO sigue llevando el evento AI (hh_ai_fifo_poll). Ver
-        // notes/2026-09-21-audio-petardeo-ref-y-plan.md.
+        // sobreproduccion y los descartes del watermark). `HH_AI_HEADROOM_MS` (30). El FIFO sigue
+        // llevando el evento AI (hh_ai_fifo_poll). Ver notes/2026-09-21-audio-petardeo-ref-y-plan.md.
         static const bool hh_report_sdl = [] {
             const char* e = getenv("HH_AI_REPORT_SDL");
-            return e != nullptr && *e != '\0' && strcmp(e, "0") != 0;
+            return !(e != nullptr && *e != '\0' && strcmp(e, "0") == 0);  // por defecto ON
         }();
         if (hh_report_sdl) {
             uint32_t q = 0;
