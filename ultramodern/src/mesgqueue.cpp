@@ -13,6 +13,10 @@
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
 
+// HH: helper de diagnostico (recomp.cpp). Los mensajes [BADMQ]/[MQDROP] son de diagnostico: se
+// emiten solo con HH_DIAG=1 para no ensuciar la consola en uso normal.
+extern "C" int hh_diag_enabled(void);
+
 // HH: diagnostico de fuga de pila (ver recomp.cpp).
 extern "C" double hh_time_now(void);
 extern "C" int hh_diag_enabled(void);
@@ -80,7 +84,7 @@ static void hh_check_mq(const char* where, PTR(OSMesgQueue) mq) {
     uint32_t v = (uint32_t)mq;
     if (v != 0 && (v < 0x80000000u || v >= 0x80800000u || (v & 3u))) {
         static int hh_n = 0;
-        if (hh_n++ < 30) fprintf(stderr, "[BADMQ] %s mq=%08X\n", where, v);
+        if (hh_diag_enabled() && hh_n++ < 30) fprintf(stderr, "[BADMQ] %s mq=%08X\n", where, v);
     }
 }
 
@@ -279,7 +283,7 @@ void dequeue_external_messages(RDRAM_ARG1) {
             uint32_t v = (uint32_t)to_send.mq;
             if (v != 0 && (v < 0x80000000u || v >= 0x80800000u || (v & 3u))) {
                 static int hh_n = 0;
-                if (hh_n++ < 30) fprintf(stderr, "[BADMQ] dequeue mq=%08X msg=%08X jam=%d req=%d target=%08X\n",
+                if (hh_diag_enabled() && hh_n++ < 30) fprintf(stderr, "[BADMQ] dequeue mq=%08X msg=%08X jam=%d req=%d target=%08X\n",
                     v, (unsigned)to_send.mesg, (int)to_send.jam, (int)to_send.requeue_if_blocked, (unsigned)to_send.target);
             }
         }
@@ -292,7 +296,7 @@ void dequeue_external_messages(RDRAM_ARG1) {
                 // HH: mensaje externo descartado por cola llena: si el juego lo espera en un
                 // osRecvMesg bloqueante, ese hilo queda colgado (patron del cuelgue del NPC).
                 static int hh_dropn = 0;
-                if (hh_dropn++ < 100) {
+                if (hh_diag_enabled() && hh_dropn++ < 100) {
                     fprintf(stderr, "[MQDROP] mq=%08X msg=%08X jam=%d (cola llena, sin requeue)\n",
                             (unsigned)to_send.mq, (unsigned)to_send.mesg, (int)to_send.jam);
                 }
@@ -323,7 +327,7 @@ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
         }
         else {
             static int hh_dropn = 0;
-            if (hh_dropn++ < 100) {
+            if (hh_diag_enabled() && hh_dropn++ < 100) {
                 fprintf(stderr, "[MQDROP] (wait) mq=%08X msg=%08X jam=%d (cola llena, sin requeue)\n",
                         (unsigned)to_send.mq, (unsigned)to_send.mesg, (int)to_send.jam);
             }
@@ -416,7 +420,7 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block, P
         uint32_t mp = (uint32_t)mq_;
         if (mp != 0 && (mp < 0x80000000u || mp >= 0x80800000u || (mp & 3u))) {
             static int hh_n = 0;
-            if (hh_n++ < 40) fprintf(stderr, "[BADMQ] fields ptr mq=%08X msg=%08X ra=%08X sp=%08X\n",
+            if (hh_diag_enabled() && hh_n++ < 40) fprintf(stderr, "[BADMQ] fields ptr mq=%08X msg=%08X ra=%08X sp=%08X\n",
                                      mp, (unsigned)msg, hh_current_ra(), hh_current_sp());
             return false;
         }
@@ -426,7 +430,7 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block, P
             if (mq_chk->msgCount <= 0 || mq_chk->msgCount > 0x10000 ||
                 mbuf < 0x80000000u || mbuf >= 0x80800000u || (mbuf & 3u)) {
                 static int hh_n = 0;
-                if (hh_n++ < 40) {
+                if (hh_diag_enabled() && hh_n++ < 40) {
                     fprintf(stderr, "[BADMQ] fields mq=%08X msgCount=%d valid=%d first=%d msg=%08X (msg=%08X ra=%08X sp=%08X)\n",
                             mp, (int)mq_chk->msgCount, (int)mq_chk->validCount, (int)mq_chk->first,
                             mbuf, (unsigned)msg, hh_current_ra(), hh_current_sp());
