@@ -2017,17 +2017,9 @@ void recomp::start(const recomp::Configuration& cfg) {
     ultramodern::join_thread_cleaner_thread();
     ultramodern::join_saving_thread();
     
-    // Free rdram.
-    bool free_failed;
-#ifdef _WIN32
-    // VirtualFree returns zero on failure.
-    free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
-#else
-    // munmap returns -1 on failure.
-    free_failed = (munmap(rdram, allocation_size) == -1);
-#endif
-
-    if (free_failed) {
-        printf("Failed to free rdram\n");
-    }
+    // HH (M4c): NO liberar rdram al salir. El hilo de frame del juego puede seguir ejecutando
+    // codigo recompilado (que lee rdram) mientras el apagado avanza; liberar aqui provoca un SEGV
+    // al cerrar (munmap -> el hilo de frame lee rdram desmapeada). El SO recupera la memoria al
+    // terminar el proceso, asi que no liberar no tiene coste real.
+    (void)allocation_size;
 }
