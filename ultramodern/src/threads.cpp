@@ -356,7 +356,12 @@ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
     }
 }
 
+// HH (M4c): el flag de salida vive en recomp.cpp; al apagarse, el planificador cooperativo debe
+// DEJAR de despachar hilos (si sigue, resucita hilos ya liberados -> UAF en el registro-sombra).
+extern std::atomic_bool exited;
+
 void resume_thread(OSThread* t) {
+    if (exited) return;
     debug_printf("[Thread] Resuming execution of thread %d\n", hh_sh_get_id(t));
     hh_schedlog("signal tid=%d\n", (int)hh_sh_get_id(t));
     // HH: contexto por el registro host (el campo guest puede estar pisado por el juego).
@@ -366,6 +371,8 @@ void resume_thread(OSThread* t) {
 }
 
 void run_next_thread(RDRAM_ARG1) {
+    // HH (M4c): en el apagado no despachar; el llamador se aparca en wait_for_resumed.
+    if (exited) return;
     if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
         throw std::runtime_error("No threads left to run!\n");
     }
@@ -383,6 +390,8 @@ void ultramodern::run_next_thread_and_wait(RDRAM_ARG1) {
     // HH: contexto propio del hilo (thread_local), no `thread_self->context` (struct guest, puede
     // estar destruido/reutilizado por el juego). Fallback al struct si no se inicializo (boot).
     UltraThreadContext* cur_context = self_context != nullptr ? self_context : TO_PTR(OSThread, thread_self)->context;
+    // HH (M4c): en el apagado, aparcar sin despachar ni tocar el registro-sombra.
+    if (exited) { wait_for_resumed(PASS_RDRAM cur_context); return; }
     hh_schedlog("rntw tid=%d ra=%08X\n", (int)hh_sh_get_id(TO_PTR(OSThread, thread_self)), hh_guest_ra());
     // If there are no runnable game threads, idle on external (hardware/OS) messages instead of
     // aborting. Processing an external message on this game thread delivers it under the game
